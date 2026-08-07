@@ -1,0 +1,87 @@
+name: Aios Sentinel
+
+# 三個觸發時機各有目的：
+#  - push/PR：改到偵測規則時，先確保規則自身的測試通過（離線，不碰線上站）
+#  - 排程：每天對正式站做一次完整檢測，抓「昨天還好、今天壞了」的漂移
+#  - 手動：出事時能立刻對任意站台重跑
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "0 21 * * *" # 每日 05:00（台北時間）
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 受測站台
+        required: false
+        default: https://ai-os-app.zeabur.app
+      fail_on:
+        description: 失敗門檻（critical/high/medium/low/info）
+        required: false
+        default: high
+
+jobs:
+  # 規則自身的測試。這一關必須離線可跑——線上站掛掉時不該連帶讓規則測試變紅，
+  # 否則沒人分得清是「規則寫壞」還是「站台出事」。
+  unit:
+    name: 偵測規則單元測試
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  scan:
+    name: 三端檢測
+    runs-on: ubuntu-latest
+    needs: unit
+    # 排程與手動才對線上站發請求；一般 push 不打正式站（避免每次提交都製造流量）
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      # 殼層稽核需要 ai_os 的設定檔
+      - name: 取出 ai_os 原始碼
+        uses: actions/checkout@v4
+        with:
+          repository: aa0968111723-prog/ai_os
+          path: ai_os
+          token: ${{ secrets.AIOS_REPO_TOKEN || github.token }}
+        continue-on-error: true # 取不到就只跳過殼層稽核，其餘照跑
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+
+      - name: 執行完整檢測
+        id: sentinel
+        env:
+          TEST_EMAIL: ${{ secrets.SENTINEL_TEST_EMAIL }}
+          TEST_PW: ${{ secrets.SENTINEL_TEST_PW }}
+        run: |
+          npm run sentinel -- all \
+            --target "${{ github.event.inputs.target || 'https://ai-os-app.zeabur.app' }}" \
+            --repo ./ai_os \
+            --fail-on "${{ github.event.inputs.fail_on || 'high' }}"
+
+      # 無論成敗都要留報告——檢測失敗時報告才是最需要看的東西
+      - name: 上傳報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-report
+          path: reports/
+          retention-days: 30
+
+      - name: 摘要
+        if: always()
+        run: cat reports/report.md >> "$GITHUB_STEP_SUMMARY" || echo "報告未產出" >> "$GITHUB_STEP_SUMMARY"
