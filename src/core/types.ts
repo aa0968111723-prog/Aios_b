@@ -23,7 +23,8 @@ export type Category =
   | "availability" // 可用性：健康檢查、就緒分項、連線
   | "page" // 頁面測試：掛載、console 錯誤、破圖、版面溢出
   | "a11y" // 無障礙
-  | "integrity"; // 一致性：三端 build 漂移、殼層設定與線上站是否對得起來
+  | "integrity" // 一致性：三端 build 漂移、殼層設定與線上站是否對得起來
+  | "monitoring"; // 監測：使用者行為分析（PostHog）、平台錯誤（Zeabur）、資料庫進出、裝置紀錄
 
 export interface Finding {
   /** 穩定 id（`檢查名.問題名`），供去重、抑制清單、以及跨次執行比對「是不是同一件事」。 */

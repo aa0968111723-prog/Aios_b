@@ -12,6 +12,7 @@
     "scan": "tsx src/cli.ts scan",
     "pages": "tsx src/cli.ts pages",
     "shells": "tsx src/cli.ts shells",
+    "monitor": "tsx src/cli.ts monitor",
     "all": "tsx src/cli.ts all",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
