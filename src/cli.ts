@@ -3,10 +3,11 @@
  * Aios Sentinel CLI。
  *
  * 指令：
- *   scan    資安 + 可用性掃描（純 HTTP，不需要瀏覽器）
- *   pages   頁面測試（需要 playwright）
- *   shells  App／桌面殼層靜態設定稽核（讀 ai_os 原始碼，不需要網路）
- *   all     以上全部
+ *   scan     資安 + 可用性掃描（純 HTTP，不需要瀏覽器）
+ *   pages    頁面測試（需要 playwright）
+ *   shells   App／桌面殼層靜態設定稽核（讀 ai_os 原始碼，不需要網路）
+ *   monitor  深度監測：PostHog 使用者行為、Zeabur 平台錯誤、資料庫進出、裝置紀錄
+ *   all      以上全部
  *
  * 設計取捨：預設**不需要任何參數**就能對正式站跑完整掃描。
  * 需要 12 個旗標才跑得起來的工具，最後不會有人跑。
@@ -24,6 +25,10 @@ import { checkDisclosure } from "./detectors/disclosure.js";
 import { checkCors } from "./detectors/cors.js";
 import { checkBuildDrift } from "./detectors/buildDrift.js";
 import { checkShells } from "./detectors/shellAudit.js";
+import { checkAnalytics } from "./detectors/analytics.js";
+import { checkZeabur } from "./detectors/zeabur.js";
+import { checkDbTraffic } from "./detectors/dbTraffic.js";
+import { checkDevice } from "./detectors/device.js";
 import { checkPages } from "./pages/pageTest.js";
 import { checkA11y } from "./pages/a11y.js";
 import { launchBrowser } from "./pages/browser.js";
@@ -47,6 +52,7 @@ Aios Sentinel — aios 網站／App／桌面三端的錯誤、資訊安全與頁
   scan        資安與可用性掃描（HTTP 層，不需瀏覽器）
   pages       頁面測試與無障礙掃描（需要 playwright）
   shells      App／桌面殼層設定稽核（讀原始碼，不需網路）
+  monitor     深度監測：使用者行為（PostHog）、平台錯誤（Zeabur）、資料庫進出、裝置紀錄
   all         以上全部
 
 選項：
@@ -66,6 +72,10 @@ Aios Sentinel — aios 網站／App／桌面三端的錯誤、資訊安全與頁
   AIOS_WEB_TARGET / AIOS_APP_TARGET / AIOS_DESKTOP_TARGET
                                     個別覆寫某一端的站台（用於偵測版本漂移）
   TEST_EMAIL / TEST_PW              頁面測試的登入帳密；不提供則只測公開路由
+  POSTHOG_API_KEY / POSTHOG_PROJECT_ID / POSTHOG_HOST
+                                    monitor 深度拉取近期使用者行為與前端例外（不提供則略過該段）
+  ZEABUR_API_TOKEN / ZEABUR_SERVICE_ID
+                                    monitor 深度拉取 Zeabur 部署狀態（不提供則略過該段）
 
 範例：
   npm run sentinel -- all --repo ../ai_os
@@ -217,6 +227,53 @@ async function planScan(config: SentinelConfig): Promise<PlannedCheck[]> {
   return checks;
 }
 
+/** 監測：使用者行為（PostHog）、平台錯誤（Zeabur）、資料庫進出、裝置紀錄。 */
+async function planMonitor(config: SentinelConfig): Promise<PlannedCheck[]> {
+  const { surfaces, timeoutMs, repoPath } = config;
+  const checks: PlannedCheck[] = [];
+
+  const reachable: typeof surfaces = [];
+  for (const surface of surfaces) {
+    const state = await preflight(surface, timeoutMs);
+    if (state.ok) reachable.push(surface);
+    else {
+      for (const name of ["analytics", "zeabur", "db-traffic"]) {
+        checks.push({
+          name,
+          category: "monitoring",
+          surface: surface.id,
+          run: async () => ({
+            check: name,
+            category: "monitoring",
+            surface: surface.id,
+            completed: false,
+            skippedReason: state.reason,
+            durationMs: 0,
+            findings: [],
+          }),
+        });
+      }
+    }
+  }
+
+  checks.push(
+    ...perSurface(reachable, "analytics", "monitoring", (s) => () => checkAnalytics(s, repoPath, timeoutMs)),
+    ...perSurface(reachable, "zeabur", "monitoring", (s) => () => checkZeabur(s, timeoutMs)),
+    ...perSurface(reachable, "db-traffic", "monitoring", (s) => () => checkDbTraffic(s, repoPath, timeoutMs)),
+  );
+
+  if (reachable.length > 0) {
+    checks.push({
+      name: "device",
+      category: "monitoring",
+      surface: "all",
+      run: () => checkDevice(reachable, timeoutMs),
+    });
+  }
+
+  return checks;
+}
+
 function planShells(config: SentinelConfig): PlannedCheck[] {
   return [
     {
@@ -313,8 +370,8 @@ async function main(): Promise<void> {
     const value = args.flags.get(name);
     return typeof value === "string" ? value : undefined;
   });
-  const wantsShells = command === "shells" || command === "all";
-  if (!jsonOnly && wantsShells) {
+  const wantsRepo = command === "shells" || command === "monitor" || command === "all";
+  if (!jsonOnly && wantsRepo) {
     if (repo.path) {
       const how = repo.source === "auto" ? "自動探測" : repo.source === "env" ? "AIOS_REPO" : "--repo";
       process.stdout.write(`連結 ai_os 原始碼（${how}）：${repo.path}\n`);
@@ -328,6 +385,7 @@ async function main(): Promise<void> {
 
   if (command === "scan" || command === "all") checks.push(...(await planScan(config)));
   if (command === "shells" || command === "all") checks.push(...planShells(config));
+  if (command === "monitor" || command === "all") checks.push(...(await planMonitor(config)));
   if (command === "pages" || command === "all") {
     const planned = await planPages(config, args);
     checks.push(...planned.checks);

@@ -19,6 +19,7 @@ const CATEGORY_LABEL: Record<string, string> = {
   page: "頁面",
   a11y: "無障礙",
   integrity: "一致性",
+  monitoring: "監測",
 };
 
 function escapeCell(text: string): string {
