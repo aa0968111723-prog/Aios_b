@@ -1,12 +1,17 @@
 /**
  * 使用者行為監測稽核（PostHog）。
  *
- * ai_os 用 PostHog 監測前端行為與例外（`client/src/posthog.ts`，延後載入的代理）。
+ * ai_os 用 PostHog 監測前端行為與例外（`client/src/posthog.ts`）。
+ * 現況是**延遲載入代理**：`main.tsx` 仍靜態 `import "./posthog"`（代理進 entry chunk），
+ * 真正的 `posthog-js` 在 idle 時才動態 import。因此：
+ * - **靜態**讀 `posthog.ts` 仍看得到 `capture_exceptions` 與 env 金鑰用法；
+ * - **線上**掃 entry chunk 仍找得到 `posthog`／ingestion host 字串（代理本體在 entry）；
+ * - 找不到才報 `not-loaded`——金鑰漏設時事件會靜默全掉，比「沒裝分析」更危險。
+ *
  * 這組檢查回答三個問題：
  *
  * 1. **靜態**：分析的設定本身有沒有監測盲區或隱私問題？（讀原始碼）
  * 2. **線上**：正式站真的有把分析載進去嗎？CSP 有沒有放行 PostHog？
- *    ——最危險的失效是「金鑰沒注入到 build，事件靜默全掉」，ai_os 自己的註解就寫了這點。
  * 3. **深度**（需 PostHog API 金鑰）：實際使用者行為長什麼樣？近期有沒有事件、
  *    有沒有前端例外、裝置分布如何？沒金鑰時誠實標記跳過，不假裝有在監測。
  *
@@ -115,13 +120,19 @@ export function analyzePosthogSource(facts: PosthogSourceFacts, where: string): 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface RuntimeAnalyticsInput {
-  /** 進入點 JS（posthog 代理是被 main.tsx 靜態 import 的，所以會在 entry chunk）。 */
+  /**
+   * 進入點 JS。ai_os 的 posthog 代理被 main.tsx 靜態 import，所以代理＋
+   * `api_host`／金鑰字串會在 entry；`posthog-js` 本體是另一切 chunk，不在此掃。
+   */
   entryJs: string;
   /** transport 檢查解析到的 CSP script-src 指令（可能為 null＝沒設 CSP）。 */
   cspScriptSrc: string[] | null;
 }
 
-/** entry chunk 裡有沒有 PostHog 的痕跡，以及注入的 ingestion host。 */
+/**
+ * entry chunk 裡有沒有 PostHog 的痕跡，以及注入的 ingestion host。
+ * 對延遲載入代理：有代理字串即可判定「有接分析」；本體 chunk 晚載不影響此啟發式。
+ */
 export function detectPosthogInBundle(entryJs: string): { present: boolean; host: string | null } {
   const present = /posthog/i.test(entryJs);
   const host = /https?:\/\/[a-z0-9.-]*posthog\.com/i.exec(entryJs)?.[0]

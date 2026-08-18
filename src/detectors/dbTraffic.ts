@@ -11,7 +11,7 @@
  * 另外從原始碼稽核 DB 是否被不當暴露（連線字串進了前端、公開的 Studio 路由）。
  * 取樣刻意序列、間隔進行，不對小型部署造成突發負載。
  */
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { finding, stopwatch } from "../core/findings.js";
 import { isProbeFailure, join, parseJson, tryProbe } from "../core/http.js";
@@ -155,6 +155,64 @@ export function analyzeDbExposure(input: DbExposureInput): Finding[] {
   return out;
 }
 
+/**
+ * 從 package.json scripts 與伺服器原始碼找出「公開的」DB 管理介面線索。
+ *
+ * 本機專用腳本（如 `db:studio`）不報——那是開發者自己開的。
+ * 只抓會跟著正式服務一起起來的東西：start／serve／prod 腳本，或 HTTP 路由掛載。
+ */
+export function detectPublicStudioRoute(sources: Array<{ where: string; content: string }>): string | null {
+  for (const { where, content } of sources) {
+    if (where === "package.json" || where.endsWith("/package.json")) {
+      try {
+        const pkg = JSON.parse(content) as { scripts?: Record<string, string> };
+        for (const [name, cmd] of Object.entries(pkg.scripts ?? {})) {
+          if (!/^(start|serve|prod|production|server)(:|$)/i.test(name)) continue;
+          if (/drizzle-kit\s+studio|\bpgweb\b|\badminer\b/i.test(cmd)) {
+            return `package.json scripts.${name}: ${cmd}`;
+          }
+        }
+      } catch {
+        /* 壞掉的 package.json 不當成發現 */
+      }
+      continue;
+    }
+
+    const route =
+      /(?:\.(?:get|use|all|post)\s*\(\s*|path\s*:\s*|route\s*\(\s*)["'`](\/(?:studio|pgweb|adminer)[^"'`]*)["'`]/i.exec(
+        content,
+      )?.[1] ??
+      /["'`](\/(?:studio|pgweb|adminer)(?:\/[^"'`]*)?)["'`]\s*,\s*(?:async\s*)?(?:\(|function)/i.exec(content)?.[1];
+    if (route) return `${where}: ${route}`;
+
+    if (/drizzle-kit\s+studio/i.test(content) && /0\.0\.0\.0|\.listen\s*\(/i.test(content)) {
+      return `${where}: drizzle-kit studio`;
+    }
+  }
+  return null;
+}
+
+/** 蒐集可能掛公開 Studio 的原始碼片段（package.json + server 進入點／含關鍵字的檔）。 */
+async function collectStudioSources(repoPath: string): Promise<Array<{ where: string; content: string }>> {
+  const out: Array<{ where: string; content: string }> = [];
+  for (const rel of ["package.json", "server/index.ts"]) {
+    const content = await readIfExists(path.join(repoPath, rel));
+    if (content) out.push({ where: rel, content });
+  }
+  try {
+    const entries = await readdir(path.join(repoPath, "server"));
+    for (const name of entries) {
+      if (!name.endsWith(".ts") || name === "index.ts") continue;
+      const rel = `server/${name}`;
+      const content = await readIfExists(path.join(repoPath, rel));
+      if (content && /studio|pgweb|adminer/i.test(content)) out.push({ where: rel, content });
+    }
+  } catch {
+    /* 沒有 server/ 就略過 */
+  }
+  return out;
+}
+
 // ── 執行 ──────────────────────────────────────────────────────────────────────
 
 async function sampleReady(surface: Surface, timeoutMs: number): Promise<ReadySample> {
@@ -210,15 +268,18 @@ export async function checkDbTraffic(
   // 原始碼稽核（有 repo 才跑；只在 web 端跑一次，避免三端重複同一份原始碼判定）。
   if (repoPath && surface.id === "web") {
     const clientDir = path.join(repoPath, "client/src");
-    const [main, viteEnv] = await Promise.all([
+    const [main, viteEnv, studioSources] = await Promise.all([
       readIfExists(path.join(clientDir, "main.tsx")),
       readIfExists(path.join(repoPath, "client/src/vite-env.d.ts")),
+      collectStudioSources(repoPath),
     ]);
     const clientBlob = `${main ?? ""}\n${viteEnv ?? ""}`;
+    const publicStudioRoute = detectPublicStudioRoute(studioSources);
+    facts.publicStudioRoute = publicStudioRoute;
     findings.push(
       ...analyzeDbExposure({
         clientReferencesDbUrl: /DATABASE_URL|postgres:\/\//.test(clientBlob),
-        publicStudioRoute: null,
+        publicStudioRoute,
       }),
     );
   }

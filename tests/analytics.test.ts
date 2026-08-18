@@ -25,6 +25,28 @@ client.init(posthogKey, {
 });
 `;
 
+/**
+ * 延遲載入代理的真實形狀：靜態模組裡有 env／init 選項，本體用 dynamic import("posthog-js")。
+ * 靜態解析仍應讀得出例外擷取設定。
+ */
+const AIOS_POSTHOG_DEFERRED_PROXY = `
+const posthogKey = import.meta.env.VITE_POSTHOG_KEY;
+const posthogHost = import.meta.env.VITE_POSTHOG_HOST;
+async function load() {
+  const mod = await import("posthog-js");
+  const client = mod.default;
+  client.init(posthogKey, {
+    api_host: posthogHost,
+    capture_exceptions: {
+      capture_unhandled_errors: true,
+      capture_unhandled_rejections: true,
+      capture_console_errors: false,
+    },
+  });
+}
+export default { capture() {}, identify() {}, reset() {} };
+`;
+
 describe("parsePosthogSource / analyzePosthogSource", () => {
   it("讀出 ai_os 現況：有接、用 env、開例外擷取、關 console 擷取", () => {
     const f = parsePosthogSource(AIOS_POSTHOG);
@@ -33,6 +55,22 @@ describe("parsePosthogSource / analyzePosthogSource", () => {
     expect(f.captureUnhandledErrors).toBe(true);
     expect(f.captureConsoleErrors).toBe(false);
     expect(f.personalKeyLeak).toBeNull();
+  });
+
+  it("延遲載入代理原始碼仍能讀出例外擷取與 env 金鑰", () => {
+    const f = parsePosthogSource(AIOS_POSTHOG_DEFERRED_PROXY);
+    expect(f.wired).toBe(true);
+    expect(f.usesEnvKey).toBe(true);
+    expect(f.captureUnhandledErrors).toBe(true);
+    expect(f.captureConsoleErrors).toBe(false);
+    const findings = analyzePosthogSource(f, "client/src/posthog.ts");
+    expect(ids(findings)).toEqual(["analytics.posthog.no-console-capture"]);
+  });
+
+  it("延遲載入代理的 entry 殘留字串仍判定有載 PostHog", () => {
+    // 代理進 entry 後 minify 仍會留下 posthog host／識別字串；本體 chunk 不在此。
+    const entry = `const ga="https://us.posthog.com";function load(){return import("posthog-js")}`;
+    expect(detectPosthogInBundle(entry)).toEqual({ present: true, host: "https://us.posthog.com" });
   });
 
   it("ai_os 現況只報「未擷取 console 錯誤」的 low", () => {
