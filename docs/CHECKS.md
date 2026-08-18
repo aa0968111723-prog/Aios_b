@@ -185,3 +185,57 @@ axe-core WCAG 2.0/2.1 A+AA。impact 對應：`critical`→high、`serious`→med
 `moderate`→low、`minor` 不報。同規則跨路由聚合成一筆，附上出現的頁面清單。
 
 只在網頁端跑一次——三端載的是同一份 DOM，重複掃只會產生三份一模一樣的違規清單。
+
+---
+
+# 監測（monitor）
+
+`monitor` 指令深度連結 aios 的實際運行面：使用者行為分析、平台錯誤、資料庫進出、裝置。
+原始碼類判定（PostHog 用戶端設定、DB 暴露）只在 **web 端跑一次**，避免三端重複同一份判定。
+
+## analytics（PostHog 使用者行為）
+
+| id | 等級 | 判定 |
+| --- | --- | --- |
+| `analytics.posthog.personal-key-leak` | critical | 前端疑似寫死 `phx_`／`phs_` 個人金鑰（公開的 `phc_` 專案金鑰不報） |
+| `analytics.posthog.no-exception-capture` | medium | 未開 `capture_unhandled_errors`，前端例外不進監測 |
+| `analytics.posthog.no-console-capture` | low | 未擷取 console 錯誤（ai_os 現況取捨） |
+| `analytics.posthog.not-loaded` | high | 正式站進入點找不到 PostHog——金鑰漏設時事件會靜默全掉 |
+| `analytics.posthog.csp-blocked` | high | 有載 PostHog 但 CSP `script-src` 未放行其來源，請求會被瀏覽器擋掉 |
+| `analytics.posthog.no-recent-events` | high | （需 API 金鑰）觀測窗內 0 事件，分析疑似靜默失效 |
+| `analytics.posthog.exceptions-observed` | medium | （需 API 金鑰）觀測到前端例外事件 |
+
+深度段需 `POSTHOG_API_KEY`／`POSTHOG_PROJECT_ID`／`POSTHOG_HOST`；未提供時記錄 `insightSkipped`，不假裝有拉到資料。
+
+## zeabur（平台錯誤）
+
+| id | 等級 | 判定 |
+| --- | --- | --- |
+| `zeabur.edge-5xx` | high | 反向代理回 502/503/504 且非應用頁面（後端當掉／冷啟動） |
+| `zeabur.gateway-intercept` | medium | 回應被中介層攔截，本輪其實沒觸及站台 |
+| `zeabur.ephemeral-storage` | high | 就緒 storage 分項顯示素材存非持久磁碟，重新部署即遺失 |
+| `zeabur.deploy-failed` | high | （需 API token）最近一次部署狀態為 FAILED/ERROR |
+
+應用自己回的 5xx（帶 SPA 外殼或應用 JSON）歸類為 `app-error`，交由 health/page-test 處理，不在此重報。
+深度段需 `ZEABUR_API_TOKEN`／`ZEABUR_SERVICE_ID`。
+
+## db-traffic（資料庫進出）
+
+連續取樣 `/api/ready`（會實打 DB）觀測連線與往返，序列進行以免造成突發負載。
+
+| id | 等級 | 判定 |
+| --- | --- | --- |
+| `db.unreachable` | critical | db 分項失敗，讀寫進出中斷 |
+| `db.ready-timeout` | high | 取樣全數逾時，連線池疑似耗盡 |
+| `db.slow-roundtrip` | medium | 就緒平均延遲 > 1500ms（DB 往返偏慢） |
+| `db.url-in-client` | critical | 連線字串疑似出現在前端 |
+| `db.public-studio` | high | 疑似有公開的資料庫管理介面 |
+
+## device（裝置紀錄）
+
+把每一端的裝置人格（UA、視窗、行動、觸控、殼層標頭）與實測回應原樣記入 `facts.deviceLedger`。
+
+| id | 等級 | 判定 |
+| --- | --- | --- |
+| `device.persona-mismatch.<surface>` | low | 該端裝置人格內部不一致（標為行動卻是桌面 UA／寬視窗） |
+| `device.blocked.<surface>` | high | 只有此裝置被伺服器回 403/451 而其他端正常（按裝置歧視／WAF 誤擋） |
