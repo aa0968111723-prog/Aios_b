@@ -76,10 +76,15 @@ npm run sentinel -- <指令> [選項]
 
 常用選項：
 
+> `shells`／`all` 會**自動探測**就地的 ai_os 檢出（`./ai_os`、`../ai_os`、`~/ai_os`），
+> 找到就直接連上跑殼層稽核，不必每次帶 `--repo`。優先序：`--repo` ＞ `AIOS_REPO` ＞ 自動探測。
+> 探測依據是殼層設定檔本身（capacitor.config.ts／AndroidManifest.xml／tauri.conf.json），
+> 不會把同名資料夾誤認成 ai_os；都找不到時殼層稽核照舊標記跳過，不會假裝通過。
+
 ```
 --target <url>        受測站台（預設 https://ai-os-app.zeabur.app）
 --surfaces <list>     web,app,desktop（預設全部）
---repo <path>         ai_os 原始碼路徑
+--repo <path>         ai_os 原始碼路徑（未指定則自動探測就地檢出）
 --routes <list>       自訂受測路由
 --out <dir>           報告輸出目錄（預設 ./reports）
 --fail-on <severity>  達此嚴重度即以非 0 結束（預設 high）

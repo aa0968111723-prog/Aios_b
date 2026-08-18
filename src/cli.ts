@@ -14,6 +14,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { buildSurfaces, isSurfaceId, pickSurfaces } from "./core/surfaces.js";
+import { discoverAiosRepo } from "./core/aiosRepo.js";
 import { preflight } from "./core/preflight.js";
 import { exitCodeFor, perSurface, runChecks, type PlannedCheck } from "./core/runner.js";
 import { checkHealth } from "./detectors/health.js";
@@ -103,6 +104,25 @@ function asSeverity(value: string | undefined, fallback: Severity): Severity {
   return (SEVERITY_ORDER as string[]).includes(value) ? (value as Severity) : fallback;
 }
 
+interface RepoResolution {
+  path: string | undefined;
+  source: "flag" | "env" | "auto" | "none";
+}
+
+/**
+ * 決定 ai_os 原始碼路徑。
+ * 優先序：`--repo` 明示 ＞ `AIOS_REPO` 環境變數 ＞ 就地自動探測。
+ * 都沒有時回傳 undefined（殼層稽核會據此標記跳過，而非假裝通過）。
+ */
+function resolveRepoPath(flag: (name: string) => string | undefined): RepoResolution {
+  const explicit = flag("repo");
+  if (explicit) return { path: explicit, source: "flag" };
+  if (process.env.AIOS_REPO) return { path: process.env.AIOS_REPO, source: "env" };
+  const discovered = discoverAiosRepo();
+  if (discovered) return { path: discovered, source: "auto" };
+  return { path: undefined, source: "none" };
+}
+
 function buildConfig(args: Args): SentinelConfig {
   const flag = (name: string): string | undefined => {
     const value = args.flags.get(name);
@@ -130,7 +150,7 @@ function buildConfig(args: Args): SentinelConfig {
   return {
     target,
     surfaces,
-    repoPath: flag("repo") ?? process.env.AIOS_REPO,
+    repoPath: resolveRepoPath(flag).path,
     routes: [],
     outDir: flag("out") ?? "./reports",
     failOn: asSeverity(flag("fail-on"), "high"),
@@ -288,6 +308,20 @@ async function main(): Promise<void> {
   const config = buildConfig(args);
   const jsonOnly = args.flags.get("json") === true;
   const command = args.command;
+
+  const repo = resolveRepoPath((name) => {
+    const value = args.flags.get(name);
+    return typeof value === "string" ? value : undefined;
+  });
+  const wantsShells = command === "shells" || command === "all";
+  if (!jsonOnly && wantsShells) {
+    if (repo.path) {
+      const how = repo.source === "auto" ? "自動探測" : repo.source === "env" ? "AIOS_REPO" : "--repo";
+      process.stdout.write(`連結 ai_os 原始碼（${how}）：${repo.path}\n`);
+    } else {
+      process.stdout.write("未連結 ai_os 原始碼——殼層稽核將標記跳過（設 AIOS_REPO、帶 --repo，或把 ai_os 併排檢出）。\n");
+    }
+  }
 
   const checks: PlannedCheck[] = [];
   let cleanup: () => Promise<void> = async () => {};
