@@ -62,11 +62,18 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
 
+      # `all` 含 scan／shells／monitor／pages。monitor 深度段（PostHog／Zeabur API）
+      # 為選配：未設 POSTHOG_*／ZEABUR_* secrets 時靜態＋線上段照跑，深度拉取標記略過。
       - name: 執行完整檢測
         id: sentinel
         env:
           TEST_EMAIL: ${{ secrets.SENTINEL_TEST_EMAIL }}
           TEST_PW: ${{ secrets.SENTINEL_TEST_PW }}
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          POSTHOG_PROJECT_ID: ${{ secrets.POSTHOG_PROJECT_ID }}
+          POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
+          ZEABUR_API_TOKEN: ${{ secrets.ZEABUR_API_TOKEN }}
+          ZEABUR_SERVICE_ID: ${{ secrets.ZEABUR_SERVICE_ID }}
         run: |
           npm run sentinel -- all \
             --target "${{ github.event.inputs.target || 'https://ai-os-app.zeabur.app' }}" \

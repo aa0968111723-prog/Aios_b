@@ -59,6 +59,17 @@ npm run sentinel -- all --repo ../ai_os
 | `page-test` | 逐路由巡覽：SPA 是否掛載、主內容是否卡在載入中、未捕捉 JS 例外、console 錯誤、請求失敗與 4xx/5xx、破圖、橫向溢出、行動端觸控目標、缺 title／h1、載入耗時 |
 | `a11y` | axe-core（WCAG 2.0/2.1 A+AA），只報 serious 以上並跨路由聚合 |
 
+### 深度監測（`monitor`）
+
+深度連結 aios 的實際運行面——不是「有沒有設定」，而是「線上到底發生了什麼」。
+
+| 檢查 | 內容 |
+| --- | --- |
+| `analytics` | PostHog 使用者行為監測：用戶端設定稽核（例外／console 擷取、個人金鑰外洩）、正式站是否真的載入 PostHog、CSP 有沒有把分析請求擋掉；選配以 PostHog API 拉近期事件量、前端例外與裝置分布——**分析靜默失效比沒裝分析更危險** |
+| `zeabur` | 平台層錯誤：把邊緣 5xx（代理連不到後端／冷啟動）與應用自身的 5xx 分開，抓素材存在非持久磁碟（重新部署即遺失）；選配以 Zeabur API 拉部署狀態 |
+| `db-traffic` | 資料庫進出：連續取樣會實打 DB 的 `/api/ready`，觀測連線、往返延遲與間歇逾時（連線池耗盡）；並稽核連線字串是否漏進前端 |
+| `device` | 裝置紀錄：把三端的裝置人格與實測回應原樣記入報告，抓「只有某個裝置被 WAF 擋下」這種桌面瀏覽器永遠重現不出來的問題 |
+
 ---
 
 ## 使用方式
@@ -72,6 +83,7 @@ npm run sentinel -- <指令> [選項]
 | `scan` | 資安與可用性掃描 | 網路 |
 | `pages` | 頁面測試與無障礙掃描 | 網路 + playwright |
 | `shells` | 殼層設定稽核 | `ai_os` 原始碼 |
+| `monitor` | 深度監測：PostHog 使用者行為、Zeabur 平台錯誤、資料庫進出、裝置紀錄 | 網路（＋選配 API 金鑰） |
 | `all` | 以上全部 | — |
 
 常用選項：
@@ -100,6 +112,9 @@ AIOS_WEB_TARGET / AIOS_APP_TARGET /
 AIOS_DESKTOP_TARGET                              個別覆寫某一端（用於偵測版本漂移）
 TEST_EMAIL / TEST_PW                             頁面測試登入；不提供則只測公開路由
 SENTINEL_CHROMIUM_PATH                           指向映像檔既有的 Chromium
+POSTHOG_API_KEY / POSTHOG_PROJECT_ID / POSTHOG_HOST
+                                                 monitor 深度拉取近期使用者行為與前端例外；不提供則略過該段
+ZEABUR_API_TOKEN / ZEABUR_SERVICE_ID             monitor 深度拉取 Zeabur 部署狀態；不提供則略過該段
 ```
 
 範例：
@@ -163,7 +178,7 @@ HttpOnly 是 low。一律同級只會讓人整批關掉告警。
 ## 開發
 
 ```bash
-npm test          # 129 項單元測試，全部離線可跑
+npm test          # 176 項單元測試，全部離線可跑
 npm run typecheck
 ```
 
@@ -174,9 +189,10 @@ npm run typecheck
 
 ```
 src/
-  core/       型別、嚴重度、HTTP 探針、surface 定義、連通性前置檢查、執行編排
+  core/       型別、嚴重度、HTTP 探針、surface 定義、連通性前置檢查、執行編排、ai_os 探測
   detectors/  health / transport / csp / headers / cookies / authGate /
-              disclosure / cors / buildDrift / shellAudit
+              disclosure / cors / buildDrift / shellAudit /
+              analytics（PostHog）/ zeabur / dbTraffic / device
   pages/      browser（playwright 薄封裝）/ routes / pageTest / a11y
   report/     console / markdown / html
 ```
