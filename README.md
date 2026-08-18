@@ -178,7 +178,7 @@ HttpOnly 是 low。一律同級只會讓人整批關掉告警。
 ## 開發
 
 ```bash
-npm test          # 170 項單元測試，全部離線可跑
+npm test          # 176 項單元測試，全部離線可跑
 npm run typecheck
 ```
 
