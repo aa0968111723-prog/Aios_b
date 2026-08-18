@@ -1,4 +1,5 @@
 {
   "name": "Aios Sentinel",
-  "install": "npm ci && npm run browsers:install"
+  "install": "bash .cursor/install.sh",
+  "repositoryDependencies": ["github.com/aa0968111723-prog/ai_os"]
 }
