@@ -6,7 +6,7 @@
  * 導致其他 20 項本來會抓到的問題全都沒跑到。所以每一項都包在 `safely` 裡，
  * 例外被轉成 `error` 欄位（與「發現問題」分開統計），其餘照跑。
  */
-import { countBySeverity, worstSeverity } from "./severity.js";
+import { countBySeverity, severityRank, shouldFail, worstSeverity } from "./severity.js";
 import type { CheckResult, RunReport, SentinelConfig, Severity, Surface } from "./types.js";
 
 export type CheckTask = () => Promise<CheckResult>;
@@ -76,6 +76,9 @@ export async function runChecks(
       completed: results.filter((r) => r.completed).length,
       skipped: results.filter((r) => !r.completed && r.skippedReason).length,
       errored: results.filter((r) => r.error).length,
+      // 這一輪還沒套用抑制清單（那是 annotate 的事），所以恆為 0；
+      // 欄位在這裡就給值，是為了讓 summary 的形狀在整條流程上始終一致。
+      suppressed: 0,
       findings: countBySeverity(allFindings),
       worst: worstSeverity(allFindings),
     },
@@ -102,12 +105,26 @@ export function perSurface(
  *
  * 3 是刻意分出來的：全部被跳過（連不到站、缺瀏覽器）時若回 0，CI 會顯示綠燈，
  * 而那個綠燈的意思其實是「我們什麼都沒驗」。這種假綠燈比紅燈危險得多。
+ *
+ * `onlyNew` 是導入既有專案時的務實選項：存量問題不擋 CI，但**新增與惡化要擋**。
+ * 沒有這個模式，第一次跑完就是滿江紅，接著整個檢查會被關掉——那等於沒有檢測。
+ * 但它有代價：存量的 critical 會安靜地留在那裡，所以無論如何都要求有基準可比，
+ * 沒有基準時退回一般判準，絕不因為「拿不到基準」就放行。
  */
-export function exitCodeFor(report: RunReport, failOn: Severity): number {
+export function exitCodeFor(report: RunReport, failOn: Severity, options: { onlyNew?: boolean } = {}): number {
   const { worst, completed, errored } = report.summary;
   if (completed === 0) return 3;
   if (errored > 0 && worst === null) return 2;
+
+  if (options.onlyNew && report.diff) {
+    const regressions = [...report.diff.added, ...report.diff.changed.filter((c) => isWorse(c.before.severity, c.after.severity)).map((c) => c.after)];
+    return shouldFail(regressions, failOn) ? 1 : 0;
+  }
+
   if (!worst) return 0;
-  const order: Severity[] = ["critical", "high", "medium", "low", "info"];
-  return order.indexOf(worst) <= order.indexOf(failOn) ? 1 : 0;
+  return severityRank(worst) <= severityRank(failOn) ? 1 : 0;
+}
+
+function isWorse(before: Severity, after: Severity): boolean {
+  return severityRank(after) < severityRank(before);
 }
