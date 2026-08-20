@@ -43,8 +43,24 @@ jobs:
     needs: unit
     # 排程與手動才對線上站發請求；一般 push 不打正式站（避免每次提交都製造流量）
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      # SARIF 上傳到 code scanning 需要這個；沒有它，發現只會留在 artifact 裡沒人點開。
+      security-events: write
     steps:
       - uses: actions/checkout@v4
+
+      # 取上一輪的 report.json 當基準。restore-keys 會取回前綴相符的最新一份快取，
+      # 於是每天的排程都是在跟「昨天」比，而不是每天重看同一份存量清單。
+      # 取不到就沒有基準——報告會照常產出，只是不會有「新增／已修復」那一區。
+      - name: 取回上一輪的基準
+        id: baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: baseline
+          key: sentinel-baseline-${{ github.run_id }}
+          restore-keys: |
+            sentinel-baseline-
 
       # 殼層稽核需要 ai_os 的設定檔
       - name: 取出 ai_os 原始碼
@@ -64,6 +80,22 @@ jobs:
 
       # `all` 含 scan／shells／monitor／pages。monitor 深度段（PostHog／Zeabur API）
       # 為選配：未設 POSTHOG_*／ZEABUR_* secrets 時靜態＋線上段照跑，深度拉取標記略過。
+      # 基準與抑制清單都是「有就用、沒有就不用」——但兩者的缺席都要寫進摘要。
+      # 靜默地少跑一段，日後沒有人分得清「這輪沒有新增」和「這輪根本沒比」。
+      - name: 組合選用旗標
+        id: opts
+        run: |
+          flags=""
+          if [ -f baseline/report.json ]; then
+            flags="$flags --baseline baseline/report.json"
+          else
+            echo "沒有可用的基準，本輪不做跨次比對。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f .sentinel-suppressions.json ]; then
+            flags="$flags --suppress .sentinel-suppressions.json"
+          fi
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+
       - name: 執行完整檢測
         id: sentinel
         env:
@@ -78,7 +110,30 @@ jobs:
           npm run sentinel -- all \
             --target "${{ github.event.inputs.target || 'https://ai-os-app.zeabur.app' }}" \
             --repo ./ai_os \
+            --formats json,md,html,sarif,junit \
+            ${{ steps.opts.outputs.flags }} \
             --fail-on "${{ github.event.inputs.fail_on || 'high' }}"
+
+      # SARIF 要在檢測失敗時也上傳——檢測紅燈的那一次，正是最需要在 PR 上看到細節的一次。
+      - name: 上傳 SARIF 到 code scanning
+        if: always() && hashFiles('reports/report.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/report.sarif
+          category: aios-sentinel
+
+      # 把這一輪的結果存成下一輪的基準。只有成功產出報告時才存，
+      # 否則會把一份殘缺的基準傳給明天，讓明天的「新增」欄位整個失真。
+      - name: 存成下一輪的基準
+        if: always() && hashFiles('reports/report.json') != ''
+        run: mkdir -p baseline && cp reports/report.json baseline/report.json
+
+      - name: 快取基準
+        if: always() && hashFiles('baseline/report.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: baseline
+          key: sentinel-baseline-${{ github.run_id }}
 
       # 無論成敗都要留報告——檢測失敗時報告才是最需要看的東西
       - name: 上傳報告

@@ -42,15 +42,42 @@ describe("analyzeZeabur", () => {
     expect(findings.find((f) => f.id === "zeabur.edge-5xx")?.severity).toBe("high");
   });
 
-  it("素材存非持久磁碟的 storage note＝high", () => {
+  it("storage 分項未通過且 note 指向非持久磁碟＝high", () => {
     const findings = analyzeZeabur(
       {
         root: { status: 200, body: `<div id="root"></div>`, contentType: "text/html", server: "zeabur" },
+        storageOk: false,
         storageNote: "素材存在容器本地磁碟非持久——重新部署會遺失",
       },
       web,
     );
     expect(ids(findings)).toContain("zeabur.ephemeral-storage");
+  });
+
+  // note 是自然語言，純子字串比對讀不出否定語意。舊版只看 note，於是
+  // 「Volume 已掛載，重新部署不會遺失素材」同時命中「Volume」與「遺失」兩組樣式——
+  // 把設定講清楚的健康站台，反而比含糊的更容易被誤報成 high。
+  it("storage 分項通過時，note 寫得再詳細也不誤報", () => {
+    const findings = analyzeZeabur(
+      {
+        root: { status: 200, body: `<div id="root"></div>`, contentType: "text/html", server: "zeabur" },
+        storageOk: true,
+        storageNote: "ASSET_DIR=/data；Volume 已掛載，重新部署不會遺失素材",
+      },
+      web,
+    );
+    expect(ids(findings)).not.toContain("zeabur.ephemeral-storage");
+  });
+
+  it("拿不到 storage 分項狀態時不猜——沒有前提就不下判定", () => {
+    const findings = analyzeZeabur(
+      {
+        root: { status: 200, body: `<div id="root"></div>`, contentType: "text/html", server: "zeabur" },
+        storageNote: "Volume 遺失",
+      },
+      web,
+    );
+    expect(ids(findings)).not.toContain("zeabur.ephemeral-storage");
   });
 
   it("健康的站台不報平台錯誤", () => {

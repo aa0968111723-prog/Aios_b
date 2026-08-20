@@ -2,7 +2,8 @@
  * 終端輸出。CI 日誌與本機執行都看這個，所以要能在沒有顏色的環境下依然可讀
  * （顏色只是加分，資訊不靠顏色承載）。
  */
-import { sortFindings } from "../core/severity.js";
+import { sortFindings, severityRank } from "../core/severity.js";
+import { findingKey } from "../core/findings.js";
 import { allFindings } from "../core/runner.js";
 import type { RunReport, Severity } from "../core/types.js";
 
@@ -29,8 +30,26 @@ export function printSummary(report: RunReport): void {
     `檢查：${summary.completed}/${summary.total} 完成` +
       (summary.skipped ? `，${c("33", `${summary.skipped} 跳過`)}` : "") +
       (summary.errored ? `，${c("31", `${summary.errored} 執行錯誤`)}` : "") +
-      "\n\n",
+      (summary.suppressed ? `，${c("90", `${summary.suppressed} 已抑制`)}` : "") +
+      "\n",
   );
+
+  // 過濾過的報告不是完整檢測。這行要在最前面，否則讀者會把局部結果當成全貌。
+  if (report.filter && (report.filter.only.length > 0 || report.filter.skip.length > 0)) {
+    const parts: string[] = [];
+    if (report.filter.only.length > 0) parts.push(`只執行 ${report.filter.only.join("、")}`);
+    if (report.filter.skip.length > 0) parts.push(`略過 ${report.filter.skip.join("、")}`);
+    process.stdout.write(`${c("33", `範圍：${parts.join("；")}——未執行的項目沒有結論，不代表通過。`)}\n`);
+  }
+
+  if (report.diff) {
+    const escalated = report.diff.changed.filter((x) => severityRank(x.after.severity) < severityRank(x.before.severity)).length;
+    process.stdout.write(
+      `比對基準：${c("31", `新增 ${report.diff.added.length}`)}　${c("32", `已修復 ${report.diff.fixed.length}`)}` +
+        `　${escalated ? c("31", `惡化 ${escalated}`) : `惡化 ${escalated}`}　持續 ${report.diff.unchanged.length}\n`,
+    );
+  }
+  process.stdout.write("\n");
 
   // 未完成的檢查放最前面：這是最容易被誤讀成「通過」的東西。
   for (const r of report.results) {
@@ -56,9 +75,12 @@ export function printSummary(report: RunReport): void {
     return;
   }
 
+  const newKeys = new Set((report.diff?.added ?? []).map(findingKey));
+
   for (const f of findings) {
     const style = SEVERITY_STYLE[f.severity];
-    process.stdout.write(`${c(style.code, `[${style.label}]`)} ${f.title}\n`);
+    const isNew = newKeys.has(findingKey(f)) ? c("1;31", " 新") : "";
+    process.stdout.write(`${c(style.code, `[${style.label}]`)}${isNew} ${f.title}\n`);
     process.stdout.write(`${c("90", `           ${f.detail.split("\n")[0]}`)}\n`);
     if (f.where) process.stdout.write(`${c("90", `           位置：${f.where}`)}\n`);
     if (f.remediation) process.stdout.write(`${c("90", `           修法：${f.remediation}`)}\n`);
@@ -68,5 +90,14 @@ export function printSummary(report: RunReport): void {
   const parts = (["critical", "high", "medium", "low", "info"] as Severity[])
     .filter((s) => summary.findings[s] > 0)
     .map((s) => c(SEVERITY_STYLE[s].code, `${SEVERITY_STYLE[s].label.trim()} ${summary.findings[s]}`));
-  process.stdout.write(`合計：${parts.join("　")}\n\n`);
+  process.stdout.write(`合計：${parts.join("　")}\n`);
+
+  // 被抑制的發現只印摘要與提醒，明細留在報告檔——但絕不能完全不印，
+  // 否則抑制清單就變成「讓問題從終端消失」的開關。
+  if (summary.suppressed > 0) {
+    process.stdout.write(
+      `${c("90", `另有 ${summary.suppressed} 筆依抑制清單移出主清單（問題仍存在，明細見報告的「已抑制」一節）。`)}\n`,
+    );
+  }
+  process.stdout.write("\n");
 }

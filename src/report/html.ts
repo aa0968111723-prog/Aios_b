@@ -5,9 +5,10 @@
  * 「現在有幾件事要處理、哪一件最急、修法是什麼」。所以是單一自足檔案
  * （無外部資源、可直接寄出或放進 CI 產物），且深淺色都能讀。
  */
-import { sortFindings } from "../core/severity.js";
+import { sortFindings, severityRank } from "../core/severity.js";
+import { findingKey } from "../core/findings.js";
 import { allFindings } from "../core/runner.js";
-import type { RunReport, Severity } from "../core/types.js";
+import type { Finding, RunReport, Severity } from "../core/types.js";
 
 const SEVERITY_META: Record<Severity, { label: string; color: string }> = {
   critical: { label: "極嚴重", color: "#c0392b" },
@@ -34,6 +35,97 @@ function esc(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/**
+ * 涵蓋範圍告示。
+ * 有過濾就代表這份報告不是完整檢測——放在最上方，讓人在看到「零發現」之前就先看到範圍。
+ */
+function coverageBanner(report: RunReport): string {
+  const filter = report.filter;
+  if (!filter || (filter.only.length === 0 && filter.skip.length === 0)) return "";
+  const parts: string[] = [];
+  if (filter.only.length > 0) parts.push(`只執行 <code>${esc(filter.only.join("、"))}</code>`);
+  if (filter.skip.length > 0) parts.push(`略過 <code>${esc(filter.skip.join("、"))}</code>`);
+  return `<div class="banner warn"><b>本次檢測範圍被縮小：${parts.join("；")}。</b>
+    未執行的項目在這份報告裡沒有任何結論——不代表通過。</div>`;
+}
+
+/** 與基準的比對區塊。 */
+function diffBlock(report: RunReport): string {
+  const diff = report.diff;
+  if (!diff) return "";
+  const escalated = diff.changed.filter((c) => severityRank(c.after.severity) < severityRank(c.before.severity));
+  const improved = diff.changed.filter((c) => severityRank(c.after.severity) > severityRank(c.before.severity));
+
+  const mismatch =
+    diff.baselineTarget && diff.baselineTarget !== report.target
+      ? `<div class="banner warn">基準檔測的是 <code>${esc(diff.baselineTarget)}</code>，與本次目標不同。
+         跨站台比對只能參考，差異可能來自部署本身而非變更。</div>`
+      : "";
+
+  const row = (label: string, count: number, color: string) =>
+    `<div class="card" data-empty="${count === 0}"><div class="dot" style="background:${color}"></div>
+      <div class="num">${count}</div><div class="lbl">${label}</div></div>`;
+
+  const list = (title: string, items: Finding[]) =>
+    items.length === 0
+      ? ""
+      : `<h3 class="dh">${title}</h3><ul class="dlist">${sortFindings(items)
+          .map(
+            (f) =>
+              `<li><span class="pill" style="background:${SEVERITY_META[f.severity].color}">${SEVERITY_META[f.severity].label}</span>
+               ${esc(f.title)} <code>${esc(f.id)}</code></li>`,
+          )
+          .join("")}</ul>`;
+
+  const changedList =
+    escalated.length === 0
+      ? ""
+      : `<h3 class="dh">嚴重度惡化</h3><ul class="dlist">${escalated
+          .map(
+            (c) =>
+              `<li><span class="pill" style="background:${SEVERITY_META[c.after.severity].color}">${
+                SEVERITY_META[c.before.severity].label
+              } → ${SEVERITY_META[c.after.severity].label}</span> ${esc(c.after.title)} <code>${esc(c.after.id)}</code></li>`,
+          )
+          .join("")}</ul>`;
+
+  return `<h2>與基準比對${diff.baselineStartedAt ? `<span class="meta"> · 基準時間 ${esc(diff.baselineStartedAt)}</span>` : ""}</h2>
+    ${mismatch}
+    <div class="cards">
+      ${row("新增", diff.added.length, "#c0392b")}
+      ${row("已修復", diff.fixed.length, "#1e8449")}
+      ${row("惡化", escalated.length, "#d35400")}
+      ${row("減輕", improved.length, "#2471a3")}
+      ${row("持續", diff.unchanged.length, "#6b7280")}
+    </div>
+    ${list("新增", diff.added)}
+    ${changedList}
+    ${list("已修復（本次不再出現）", diff.fixed)}`;
+}
+
+/** 被抑制的發現。抑制是一種有期限、要具名的決定，所以它永遠留在報告上。 */
+function suppressedBlock(report: RunReport): string {
+  const suppressed = report.suppressed ?? [];
+  if (suppressed.length === 0) return "";
+  const rows = suppressed
+    .map(
+      (s) => `<tr>
+        <td><span class="pill" style="background:${SEVERITY_META[s.finding.severity].color}">${SEVERITY_META[s.finding.severity].label}</span></td>
+        <td>${esc(s.finding.title)}<br><code>${esc(s.finding.id)}</code></td>
+        <td class="note">${esc(s.reason)}</td>
+        <td class="note">${s.expires ? esc(s.expires) : "<b>永久</b>"}</td>
+        <td class="note">${esc(s.owner ?? "—")}</td>
+      </tr>`,
+    )
+    .join("");
+  return `<h2>已抑制（${suppressed.length}）</h2>
+    <div class="banner warn">這些發現<b>依然存在</b>，只是依抑制清單移出主清單。抑制不等於修好。</div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>嚴重度</th><th>問題</th><th>抑制理由</th><th>到期</th><th>負責人</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
 export function renderHtml(report: RunReport): string {
   const findings = sortFindings(allFindings(report));
   const { summary } = report;
@@ -51,12 +143,17 @@ export function renderHtml(report: RunReport): string {
     })
     .join("");
 
+  // 新增的發現要一眼看得出來：一份 40 筆的報告裡，該先處理的是這次才冒出來的那幾筆。
+  const newKeys = new Set((report.diff?.added ?? []).map(findingKey));
+
   const findingRows = findings
     .map((f, i) => {
       const meta = SEVERITY_META[f.severity];
-      return `<details class="finding" data-sev="${f.severity}" data-cat="${f.category}" data-surface="${f.surface}">
+      const isNew = newKeys.has(findingKey(f));
+      return `<details class="finding" data-sev="${f.severity}" data-cat="${f.category}" data-surface="${f.surface}" data-new="${isNew}">
       <summary>
         <span class="pill" style="background:${meta.color}">${meta.label}</span>
+        ${isNew ? '<span class="pill new">新增</span>' : ""}
         <span class="ftitle">${esc(f.title)}</span>
         <span class="meta">${CATEGORY_LABEL[f.category] ?? f.category} · ${esc(String(f.surface))}</span>
       </summary>
@@ -132,6 +229,11 @@ export function renderHtml(report: RunReport): string {
   .finding > summary { cursor: pointer; padding: .75rem .9rem; display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
   .finding > summary::-webkit-details-marker { display: none; }
   .pill { color: #fff; font-size: .72rem; padding: .1rem .5rem; border-radius: 999px; white-space: nowrap; }
+  .pill.new { background: #7d3c98; }
+  .dh { font-size: .95rem; margin: 1.25rem 0 .4rem; color: var(--muted); }
+  .dlist { margin: 0; padding-left: 1.1rem; font-size: .88rem; }
+  .dlist li { margin-bottom: .3rem; }
+  .dlist code { background: var(--code); padding: .05rem .3rem; border-radius: .25rem; font-size: .78rem; }
   .ftitle { font-weight: 600; flex: 1 1 20rem; }
   .meta { color: var(--muted); font-size: .8rem; }
   .body { padding: 0 .9rem .9rem; border-top: 1px solid var(--line); }
@@ -167,6 +269,8 @@ export function renderHtml(report: RunReport): string {
 
   <div class="cards">${cards}</div>
 
+  ${coverageBanner(report)}
+
   ${
     incomplete.length > 0
       ? `<div class="banner warn">
@@ -176,6 +280,8 @@ export function renderHtml(report: RunReport): string {
       : `<div class="banner good">所有檢查皆已完成執行。</div>`
   }
 
+  ${diffBlock(report)}
+
   <h2>發現（${findings.length}）</h2>
   <div class="filters" id="filters">
     <button data-filter="all" aria-pressed="true">全部</button>
@@ -184,8 +290,11 @@ export function renderHtml(report: RunReport): string {
     <button data-filter="medium">中</button>
     <button data-filter="low">低</button>
     <button data-filter="info">參考</button>
+    ${report.diff ? '<button data-filter="new">只看新增</button>' : ""}
   </div>
   ${findings.length > 0 ? findingRows : `<div class="banner good">本次檢測沒有發現任何問題。</div>`}
+
+  ${suppressedBlock(report)}
 
   <h2>檢查明細</h2>
   <div class="tablewrap">
@@ -205,7 +314,7 @@ export function renderHtml(report: RunReport): string {
     for (const b of filters.querySelectorAll("button")) b.setAttribute("aria-pressed", String(b === button));
     const want = button.dataset.filter;
     for (const el of document.querySelectorAll(".finding")) {
-      el.hidden = want !== "all" && el.dataset.sev !== want;
+      el.hidden = want === "all" ? false : want === "new" ? el.dataset.new !== "true" : el.dataset.sev !== want;
     }
   });
 </script>

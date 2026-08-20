@@ -8,6 +8,7 @@
  */
 import { finding, stopwatch } from "../core/findings.js";
 import { isProbeFailure, join, tryProbe } from "../core/http.js";
+import { looksLikeSpaFallback } from "./disclosure.js";
 import type { CheckResult, Finding, Severity, Surface } from "../core/types.js";
 
 export interface GuardedEndpoint {
@@ -109,17 +110,29 @@ export function trpcBlocked(body: string): boolean {
     const parsed: unknown = JSON.parse(body);
     const entries = Array.isArray(parsed) ? parsed : [parsed];
     return entries.some((entry) => {
-      const err = (entry as { error?: { data?: { code?: string }; message?: string } })?.error;
-      if (!err) return false;
-      const code = err.data?.code ?? "";
-      return /UNAUTHORIZED|FORBIDDEN/i.test(code) || /登入|未授權/.test(err.message ?? "");
+      const raw = (entry as { error?: unknown })?.error;
+      if (!raw || typeof raw !== "object") return false;
+
+      // 設了 transformer（ai_os 用 superjson）時，錯誤內容會被包在 error.json 底下。
+      // 舊版直接讀 error.data.code，於是拿到 undefined，把一個「正確擋下了」的回應
+      // 判成「未授權卻回了結果」——一筆假的 critical。
+      const err = ((raw as { json?: unknown }).json ?? raw) as {
+        data?: { code?: string; httpStatus?: number };
+        code?: number;
+        message?: string;
+      };
+
+      if (/UNAUTHORIZED|FORBIDDEN/i.test(err.data?.code ?? "")) return true;
+      if (err.data?.httpStatus === 401 || err.data?.httpStatus === 403) return true;
+      // tRPC 的 JSON-RPC 錯誤碼：-32001 UNAUTHORIZED、-32003 FORBIDDEN。
+      if (err.code === -32001 || err.code === -32003) return true;
+      return /登入|未授權|unauthori[sz]ed|forbidden/i.test(err.message ?? "");
     });
   } catch {
     return false;
   }
 }
 
-/** 回應看起來像不像「有實際資料」——用來分辨真外洩與空殼 200。 */
 export function looksLikeData(body: string, contentType: string): boolean {
   if (/application\/(zip|gzip|octet-stream)|text\/csv/i.test(contentType)) return body.length > 0;
   try {
@@ -142,6 +155,8 @@ export async function checkAuthGate(surface: Surface, timeoutMs: number): Promis
   const facts: Record<string, unknown> = {};
   const base = { check: "auth-gate", category: "security" as const, surface: surface.id };
   const observed: Record<string, string> = {};
+  /** 實際由 API 回應（而非 SPA 兜底）的端點數。全部都是兜底時代表這一輪根本沒驗到閘門。 */
+  let probedByApi = 0;
 
   for (const endpoint of GUARDED_ENDPOINTS) {
     const url = join(surface.origin, endpoint.path);
@@ -163,6 +178,19 @@ export async function checkAuthGate(surface: Surface, timeoutMs: number): Promis
     const contentType = res.headers.get("content-type") ?? "";
     const isTrpc = endpoint.path.startsWith("/api/trpc/");
     observed[endpoint.path] = `HTTP ${res.status}`;
+
+    // SPA 兜底頁必須先排除，而且必須排在所有判定之前。
+    //
+    // Vite 建置的站台會把**所有**未匹配路徑回傳 index.html（HTTP 200）。少了這道，
+    // 一個根本不存在的 /api/me/export 會拿到 200 + HTML，接著 looksLikeData 對非 JSON
+    // 一律回 true（HTML 當然「有內容」），於是被報成 critical「未認證即可存取個人資料匯出」。
+    // tRPC 那條路徑同樣中招：trpcBlocked 解析 HTML 失敗回 false，也變成 critical。
+    // 這是整份報告最刺眼的一筆，而它完全是假的——這種假警報會直接毀掉工具的可信度。
+    if (looksLikeSpaFallback(res.body, contentType)) {
+      observed[endpoint.path] = `HTTP ${res.status}（SPA 兜底頁，此路徑未由 API 掛載）`;
+      continue;
+    }
+    probedByApi += 1;
 
     // 導向到登入頁也算有擋下來（SPA 的 Express 路由多半直接回 401，但代理層可能改成 302）。
     const redirectedToLogin =
@@ -223,5 +251,23 @@ export async function checkAuthGate(surface: Surface, timeoutMs: number): Promis
   }
 
   facts.observed = observed;
+  facts.probedByApi = probedByApi;
+
+  // 每一個受保護端點都落到 SPA 兜底＝這個站沒有掛載 aios 的 API（或 API 在別的 host）。
+  // 此時「沒有發現」的真正意思是「沒有驗到任何認證閘門」，兩者絕不能混為一談：
+  // 前者會讓人以為未授權存取已經查過了，而這正是整套系統最有價值的那一組檢查。
+  if (probedByApi === 0) {
+    return {
+      ...base,
+      completed: false,
+      skippedReason:
+        `${GUARDED_ENDPOINTS.length} 個受保護端點全部回傳 SPA 兜底頁，代表 ${surface.origin} 沒有掛載 aios 的 API` +
+        "（或 API 位於另一個 host）。本輪未實際驗到任何認證閘門——請用 --target 指向真正提供 API 的位址重跑。",
+      durationMs: elapsed(),
+      findings,
+      facts,
+    };
+  }
+
   return { ...base, completed: true, durationMs: elapsed(), findings, facts };
 }

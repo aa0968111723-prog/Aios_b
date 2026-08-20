@@ -42,7 +42,13 @@ npm run sentinel -- all --repo ../ai_os
 | `auth-gate` | 未登入直接打受保護端點：`/api/selftest`、`/api/v1/databases`、`/api/me/export`、素材備份、專案匯出、tRPC 程序…。tRPC 未授權也回 HTTP 200，故改看回應內容判定 |
 | `disclosure` | `.env`、`.git`、原始碼、備份檔、`.npmrc`；source map；錯誤回應洩漏堆疊；目錄列表。**每一筆都先排除 SPA 兜底頁**，否則整排假警報 |
 | `cors` | 反射任意 Origin、`*`、`null` 來源，並與 `allow-credentials` 交叉判定 |
-| `shell-audit` | Capacitor（cleartext、http url、allowNavigation）、AndroidManifest（debuggable、allowBackup、明文流量、多餘權限）、Tauri（`csp: null`、devtools、能力萬用授權、危險 IPC） |
+| `tls` | 憑證到期（7／14／30 天分級）、主機名不符（萬用 SAN 依規格只吃一層）、自簽、弱簽章、過長效期、TLSv1／1.1、弱金鑰。連不上 443 一律標記跳過——把代理擋掉報成憑證問題是嚴重誤判 |
+| `methods` | TRACE 是否開啟與是否回吐請求（Cross-Site Tracing）、`Allow` 洩漏危險方法。**只送 OPTIONS 與 TRACE**——絕不對真實端點送寫入方法 |
+| `redirect` | 開放重導向：常見回跳參數逐一探測，處理協定相對、反斜線、`@` 混淆、子網域四種繞法；落在自家網域不報 |
+| `supply-chain` | 第三方腳本與樣式表盤點、SRI 缺失、有 integrity 卻沒 crossorigin（瀏覽器會直接拒載，靜默壞掉）、http 子資源。只看初始 HTML，動態插入的看不到 |
+| `wellknown` | `robots.txt` 是否把敏感路徑公告出去、`security.txt`（RFC 9116）是否存在且未過期 |
+| `rate-limit` | 登入端點的速率限制。**預設不執行**，需 `--probe-rate-limit` 明確授權——它會送出數次失敗嘗試，可能觸發帳號鎖定或資安告警 |
+| `shell-audit` | Capacitor（cleartext、http url、allowNavigation）、AndroidManifest（debuggable、allowBackup、明文流量、多餘權限）、Tauri（`csp: null`、devtools、能力萬用授權、危險 IPC）。解析前一律剝除註解——被註解掉的本機開發設定照收，會讓正常專案噴出整排 critical |
 
 ### 可用性與一致性
 
@@ -99,10 +105,20 @@ npm run sentinel -- <指令> [選項]
 --repo <path>         ai_os 原始碼路徑（未指定則自動探測就地檢出）
 --routes <list>       自訂受測路由
 --out <dir>           報告輸出目錄（預設 ./reports）
+--formats <list>      輸出格式：json,md,html,sarif,junit（預設前三者）
+--only <list>         只執行這些檢查或分類（例：--only security、--only csp,cors）
+--skip <list>         略過這些檢查或分類
+--baseline <path>     以既有的 report.json 為基準，比對出新增與已修復
+--suppress <path>     抑制清單 JSON（用 --init-suppress 產生範本）
 --fail-on <severity>  達此嚴重度即以非 0 結束（預設 high）
+--fail-on-new         只有新增與惡化才以非 0 結束（需搭配 --baseline）
+--probe-rate-limit    授權對登入端點做速率限制探測（預設不做，見下）
 --no-screenshots      不存截圖
 --json                只輸出 JSON 到 stdout
 ```
+
+> `--only` 與 `--skip` **不會讓被篩掉的檢查從報告上消失**——它們會變成「跳過＋原因」。
+> 直接拿掉的話，一份 `--only csp` 的報告看起來會跟一份跑完全部後全綠的報告一模一樣。
 
 環境變數：
 
@@ -132,13 +148,85 @@ TEST_EMAIL=qa@example.com TEST_PW=... npm run sentinel -- pages
 
 ### 報告
 
-每次執行輸出三份到 `--out`：
+預設輸出三份到 `--out`（用 `--formats` 可加選另外兩種）：
 
 - `report.html` — 單一自足檔案的儀表板，可直接寄出；深淺色皆可讀，支援嚴重度篩選
 - `report.md` — 貼進 PR 或 issue
-- `report.json` — 給程式消費
+- `report.json` — 給程式消費，同時也是下一次執行的**基準檔**
+- `report.sarif` — SARIF 2.1.0，上傳到 GitHub code scanning 就能在 PR 上就地標示
+- `report.junit.xml` — JUnit XML，讓 CI 既有的測試面板直接顯示三端狀態
 
-### 結束碼
+SARIF 與 JUnit 都把「跳過」與「執行錯誤」如實帶出去（SARIF 走
+`invocations[].toolExecutionNotifications`，JUnit 走 `<skipped>` 與 `<error>`）。
+兩種格式的預設語意都是「沒有 failure 就是綠的」，直接映射會把「沒測到」畫成一排綠勾——
+那正是這套系統最反對的失效方式。
+
+---
+
+## 跨次執行比對
+
+一次執行只是一張快照。真正要回答的問題是「這次多了什麼」與「上次那件修好了沒」：
+
+```bash
+# 昨天的 report.json 當基準
+npm run sentinel -- all --baseline reports/report.json
+```
+
+報告會多出一區：**新增／已修復／嚴重度惡化／持續**，主清單上的新增發現也會被標記。
+搭配 `--fail-on-new` 時，存量問題不擋 CI，但新增與惡化要擋——這是把檢測導入既有專案的
+務實做法：第一次跑完滿江紅、接著整個檢查被關掉，那等於沒有檢測。
+
+三件事刻意做成不會安靜出錯：
+
+- 基準檔讀不出來 → 產生一筆 `baseline.unreadable`（medium），**不會**當成空基準。
+  當成空基準會讓所有存量問題被報成新增；當成沒有變化則會讓真正的新增被吃掉。
+- 基準檔測的是別的站 → 報告明白寫出兩邊的目標，別把部署差異當成「這次改壞了」。
+- 沒有基準可比時 `--fail-on-new` 退回一般門檻判定——絕不因為拿不到基準就放行。
+
+CI 已接好：每天的排程會用快取滾動保存上一輪的 `report.json`，於是每天都是在跟昨天比。
+
+---
+
+## 抑制清單
+
+任何檢測系統活過三個月都會需要抑制清單——已知取捨、待排程的問題、第三方無法修的東西。
+但抑制清單本身是這類系統最常見的死法：有人為了讓 CI 變綠把整批告警關掉，
+半年後沒人記得為什麼關、也沒人重新檢視。
+
+所以這裡的立場是：**抑制是一種有期限、要具名、且永遠留在報告上的決定，
+不是讓問題消失的開關。**
+
+```bash
+npm run sentinel -- --init-suppress > .sentinel-suppressions.json
+npm run sentinel -- all --suppress .sentinel-suppressions.json
+```
+
+```json
+[
+  {
+    "id": "csp.style-src.unsafe-inline",
+    "reason": "React inline style 的已知取捨，等 CSS-in-JS 遷移完成後移除",
+    "expires": "2026-12-31",
+    "owner": "平台組"
+  }
+]
+```
+
+規則：
+
+| 行為 | 結果 |
+| --- | --- |
+| `reason` 空白或缺少 | 規則不生效，並產生 `suppress.invalid-rule`（medium） |
+| `expires` 已過 | 規則不生效，發現重新浮現，並附上 `suppress.expired`（low） |
+| 缺 `expires` | 允許，但產生 `suppress.no-expiry`（info）——永久抑制應該極少 |
+| 規則沒命中任何發現 | `suppress.stale`（info）：死規則會在問題復發時把它靜默吃掉 |
+| 蓋掉 critical 級發現 | 需要 `"acknowledgeCritical": true`，否則照常回報 |
+
+被抑制的發現連同理由、到期日、負責人留在報告的「已抑制」一區，計數也留在總覽。
+
+---
+
+## 結束碼
 
 | 碼 | 意義 |
 | --- | --- |
@@ -178,7 +266,7 @@ HttpOnly 是 low。一律同級只會讓人整批關掉告警。
 ## 開發
 
 ```bash
-npm test          # 176 項單元測試，全部離線可跑
+npm test          # 758 項測試，全部離線可跑（含以本機假站台驅動的端到端測試）
 npm run typecheck
 ```
 
@@ -187,14 +275,27 @@ npm run typecheck
 網路與檔案 I/O 集中在各偵測器的 `check*` 進入點。資安規則最容易寫錯，而寫錯的規則
 會製造假綠燈——所以規則必須能在沒有網路、不依賴線上站當時設定的情況下被測試。
 
+測試分三層，各自擋不同的失效方式：
+
+| 層 | 驗什麼 | 為什麼純函式測試不夠 |
+| --- | --- | --- |
+| 純函式 | 判定規則本身 | — |
+| 假 fetch 驅動的 `check*` | `completed` 與 `skippedReason` 的語意 | 「跳過還是通過」是 IO 層的決定，純函式看不到 |
+| `tests/cli.e2e.test.ts` | 接線 | 一個忘了接上的偵測器，在報告上看起來就跟「這項沒發現問題」一模一樣 |
+
+端到端測試起一個本機假站台（SPA 兜底、健康端點、沒有安全標頭），用子行程跑真正的 CLI 打它，
+不碰外部網路。
+
 ```
 src/
-  core/       型別、嚴重度、HTTP 探針、surface 定義、連通性前置檢查、執行編排、ai_os 探測
+  core/       型別、嚴重度、HTTP 探針、surface 定義、連通性前置檢查、執行編排、ai_os 探測、
+              跨次比對（baseline）、抑制清單（suppress）、檢查過濾（filter）、報告後製（annotate）
   detectors/  health / transport / csp / headers / cookies / authGate /
-              disclosure / cors / buildDrift / shellAudit /
+              disclosure / cors / buildDrift / shellAudit / tls / methods /
+              redirect / supplyChain / wellknown / rateLimit /
               analytics（PostHog）/ zeabur / dbTraffic / device
   pages/      browser（playwright 薄封裝）/ routes / pageTest / a11y
-  report/     console / markdown / html
+  report/     console / markdown / html / sarif / junit
 ```
 
 ## 涵蓋不到的部分

@@ -23,7 +23,9 @@ const healthy = (over: Partial<PageObservation> = {}): PageObservation => ({
   smallTouchTargets: [],
   missingH1: false,
   loadMs: 1200,
+  contentReadyMs: 1400,
   redirectedTo: null,
+  navigationError: null,
   ...over,
 });
 
@@ -131,5 +133,107 @@ describe("judgePage", () => {
     );
     expect(findings.length).toBeGreaterThan(4);
     for (const f of findings) expect(f.remediation && f.remediation.length > 0).toBe(true);
+  });
+});
+
+/**
+ * 以下這組全部來自同一類缺陷：**判定用錯了前提**。
+ *
+ * 三個具體症狀：把上一頁的觀測當成這一頁的、把「這條路由需不需要登入」當成「這一輪有沒有
+ * 登入」、把我方的等待上限當成站台的載入時間。三者都不會讓程式報錯，只會讓報告說錯話。
+ */
+describe("judgePage — 前提正確性", () => {
+  it("導覽失敗時直接收工，不拿上一頁的 DOM 當這一頁的觀測", () => {
+    const findings = judgePage(
+      healthy({
+        navigationError: "Error: net::ERR_ABORTED",
+        status: null,
+        // 以下全是「上一頁」留下來的觀測值，看起來一切正常
+        shellMounted: true,
+        contentReady: true,
+      }),
+      { surface: web!, route: publicRoute, authenticated: false },
+    );
+    expect(ids(findings)).toEqual(["page.navigation-failed./login"]);
+    expect(findings[0]?.detail).toContain("沒有任何有效觀測");
+  });
+
+  it("未登入時，公開路由上的 401 也是預期行為（前端一定會打 session 查詢）", () => {
+    const findings = judgePage(
+      healthy({ badResponses: [{ url: "https://ai-os-app.zeabur.app/api/trpc/auth.session", status: 401 }] }),
+      { surface: web!, route: publicRoute, authenticated: false },
+    );
+    expect(ids(findings)).not.toContain("page.bad-responses./login");
+  });
+
+  it("同一筆 401 的 console 訊息也要一起被排除，否則豁免形同虛設", () => {
+    const findings = judgePage(
+      healthy({
+        consoleErrors: ["Failed to load resource: the server responded with a status of 401 (Unauthorized) @ /api/trpc/auth.session"],
+      }),
+      { surface: web!, route: publicRoute, authenticated: false },
+    );
+    expect(ids(findings)).not.toContain("page.console-errors./login");
+  });
+
+  it("已登入時的 401 不再豁免——那時它是真的有問題", () => {
+    const findings = judgePage(
+      healthy({
+        badResponses: [{ url: "https://ai-os-app.zeabur.app/api/trpc/projects.list", status: 401 }],
+        consoleErrors: ["Failed to load resource: the server responded with a status of 401 (Unauthorized)"],
+      }),
+      { surface: web!, route: publicRoute, authenticated: true },
+    );
+    expect(ids(findings)).toContain("page.bad-responses./login");
+    expect(ids(findings)).toContain("page.console-errors./login");
+  });
+
+  it("內容沒就緒時不報「慢」——那個數字會是我方的等待上限，不是站台的表現", () => {
+    const findings = judgePage(healthy({ contentReady: false, loadMs: 20_100, contentReadyMs: 20_100 }), {
+      surface: web!,
+      route: publicRoute,
+      authenticated: false,
+    });
+    expect(ids(findings)).toContain("page.content-stuck./login");
+    expect(ids(findings)).not.toContain("page.slow./login");
+  });
+
+  it("內容確實出來但很慢時照報", () => {
+    const findings = judgePage(healthy({ contentReady: true, loadMs: 12_000, contentReadyMs: 13_000 }), {
+      surface: web!,
+      route: publicRoute,
+      authenticated: false,
+    });
+    expect(ids(findings)).toContain("page.slow./login");
+  });
+
+  it("未登入巡覽受保護頁時，content-stuck 與 slow 都豁免", () => {
+    const findings = judgePage(healthy({ contentReady: false, loadMs: 20_100, contentReadyMs: 20_100 }), {
+      surface: web!,
+      route: protectedRoute,
+      authenticated: false,
+    });
+    expect(ids(findings)).not.toContain("page.content-stuck./admin");
+    expect(ids(findings)).not.toContain("page.slow./admin");
+  });
+});
+
+describe("isNoise", () => {
+  it("URL 樣式要比對 location 而不是訊息文字——Chromium 的載入錯誤訊息裡沒有 URL", async () => {
+    const { isNoise } = await import("../src/pages/pageTest.js");
+    const text = "Failed to load resource: the server responded with a status of 404 (Not Found)";
+    expect(isNoise(text)).toBe(false);
+    expect(isNoise(text, "https://ai-os-app.zeabur.app/favicon.ico")).toBe(true);
+  });
+
+  it("文字樣式照舊比對訊息", async () => {
+    const { isNoise } = await import("../src/pages/pageTest.js");
+    expect(isNoise("Download the React DevTools for a better experience")).toBe(true);
+    expect(isNoise("[vite] connecting...")).toBe(true);
+  });
+
+  it("真正的錯誤不會被濾掉", async () => {
+    const { isNoise } = await import("../src/pages/pageTest.js");
+    expect(isNoise("TypeError: undefined is not a function", "https://ai-os-app.zeabur.app/assets/index.js")).toBe(false);
   });
 });

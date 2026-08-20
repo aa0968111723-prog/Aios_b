@@ -27,12 +27,24 @@ export function stopwatch(): () => number {
   return () => Date.now() - startedAt;
 }
 
+/**
+ * 一筆發現的穩定識別鍵。
+ *
+ * `id` 標明「是哪一種問題」，`where` 標明「在哪一處」——兩者合起來才是「同一件事」。
+ * 只用 id 會讓五條路徑上的同一種問題被折成一筆；只用 where 則會讓同一個網址上的
+ * 不同問題互相蓋掉。這個鍵同時服務三個地方：去重、抑制清單比對、跨次執行比對，
+ * 三者必須用同一把鍵，否則「上次抑制掉的」與「這次新增的」會對不起來。
+ */
+export function findingKey(f: Pick<Finding, "id" | "where">): string {
+  return `${f.id}::${f.where ?? ""}`;
+}
+
 /** 同 id 只留第一筆。三端掃同一個站時，同源問題會重複三次——報告只需要一次。 */
 export function dedupe(findings: Finding[]): Finding[] {
   const seen = new Set<string>();
   const out: Finding[] = [];
   for (const f of findings) {
-    const key = `${f.id}::${f.where ?? ""}`;
+    const key = findingKey(f);
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(f);

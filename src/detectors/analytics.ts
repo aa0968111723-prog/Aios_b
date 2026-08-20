@@ -24,13 +24,20 @@ import { isProbeFailure, join, tryProbe } from "../core/http.js";
 import { parseCsp } from "./csp.js";
 import type { CheckResult, Finding, Surface } from "../core/types.js";
 
-/** 從回應標頭與 HTML meta 取出 CSP 的 script-src（含 default-src 兜底）。 */
+/**
+ * 從回應標頭與 HTML meta 取出 CSP 的 script-src（含 default-src 兜底）。
+ *
+ * 回 `null` 有兩種意思，兩種都代表**沒有可據以判定的來源清單**：完全沒有 CSP，
+ * 或有 CSP 但既沒 script-src 也沒 default-src（`frame-ancestors 'none'` 這種單指令政策很常見）。
+ * 舊版後者回空陣列，而 `[]` 是 truthy——於是「這份政策沒有規範腳本來源」被讀成
+ * 「script-src 明確不含 PostHog」，任何極簡 CSP 都會被判成擋掉分析。
+ */
 function cspScriptSrcOf(header: string | null, html: string): string[] | null {
   const metaCsp = /<meta[^>]+http-equiv=["']content-security-policy["'][^>]+content=["']([^"']+)["']/i.exec(html)?.[1];
   const raw = header ?? metaCsp ?? null;
   if (!raw) return null;
   const directives = parseCsp(raw);
-  return directives.get("script-src") ?? directives.get("default-src") ?? [];
+  return directives.get("script-src") ?? directives.get("default-src") ?? null;
 }
 
 const base = { check: "analytics", category: "monitoring" as const };
@@ -125,8 +132,16 @@ export interface RuntimeAnalyticsInput {
    * `api_host`／金鑰字串會在 entry；`posthog-js` 本體是另一切 chunk，不在此掃。
    */
   entryJs: string;
-  /** transport 檢查解析到的 CSP script-src 指令（可能為 null＝沒設 CSP）。 */
+  /** transport 檢查解析到的 CSP script-src 指令（可能為 null＝沒有可據以判定的來源清單）。 */
   cspScriptSrc: string[] | null;
+  /**
+   * `entryJs` 是不是完整的 bundle。
+   *
+   * 讀不完就不能宣稱「裡面沒有 PostHog」——大型 React 應用的 entry chunk 動輒數 MB，
+   * 而 probe 有讀取上限。少了這個旗標，一個分析正常運作的站台會被報成
+   * 「正式站似乎未載入 PostHog」（high），而那是報告裡最像真問題的一種假警報。
+   */
+  entryComplete: boolean;
 }
 
 /**
@@ -161,6 +176,12 @@ function scriptSrcAllows(scriptSrc: string[], host: string): boolean {
 export function analyzePosthogRuntime(input: RuntimeAnalyticsInput, surface: Surface, where: string): Finding[] {
   const out: Finding[] = [];
   const { present, host } = detectPosthogInBundle(input.entryJs);
+
+  if (!present && !input.entryComplete) {
+    // 沒讀完整個 bundle 就不能說裡面沒有 PostHog。這裡刻意不產生任何發現，
+    // 由呼叫端把「未判定」寫進 facts——猜一個 high 出來，比沉默更糟。
+    return out;
+  }
 
   if (!present) {
     out.push(
@@ -317,17 +338,43 @@ export async function checkAnalytics(
 
   // ── 線上：正式站是否載入並放行 PostHog ─────────────────────────────
   const home = await tryProbe(surface.origin, { surface, timeoutMs, followRedirects: 2 });
-  if (!isProbeFailure(home)) {
-    const cspScriptSrc = cspScriptSrcOf(home.headers.get("content-security-policy"), home.body);
-    const entryUrl = entryScriptUrl(home.body, surface.origin);
-    facts.entryScript = entryUrl;
-    if (entryUrl) {
-      const entry = await tryProbe(entryUrl, { surface, timeoutMs, followRedirects: 2 });
-      if (!isProbeFailure(entry)) {
-        const detected = detectPosthogInBundle(entry.body);
-        facts.posthog = detected;
-        findings.push(...analyzePosthogRuntime({ entryJs: entry.body, cspScriptSrc }, surface, entryUrl));
+  if (isProbeFailure(home)) {
+    // 連不上就沒有線上段可言。回 completed: true 加零發現，等於宣稱「正式站有載入 PostHog、
+    // CSP 也放行了」——那兩件事這一輪一項都沒測。（checkZeabur 早就是這樣處理的。）
+    return {
+      ...meta,
+      completed: false,
+      skippedReason: `無法連線至 ${surface.origin}（${home.error}），本輪未驗證正式站是否載入 PostHog 或 CSP 是否放行分析來源。`,
+      durationMs: elapsed(),
+      findings,
+      facts,
+    };
+  }
+
+  const cspScriptSrc = cspScriptSrcOf(home.headers.get("content-security-policy"), home.body);
+  const entryUrl = entryScriptUrl(home.body, surface.origin);
+  facts.entryScript = entryUrl;
+
+  if (!entryUrl) {
+    facts.runtimeSkipped = "首頁 HTML 裡找不到進入點腳本，本輪未判定正式站是否載入 PostHog。";
+  } else {
+    // entry chunk 動輒數 MB，而 probe 預設只讀 512KB。用預設值會把一個分析正常的站台
+    // 報成「未載入 PostHog」——這是報告裡最像真問題的一種假警報。
+    const entry = await tryProbe(entryUrl, { surface, timeoutMs, followRedirects: 2, maxBodyBytes: 8 * 1024 * 1024 });
+    if (isProbeFailure(entry)) {
+      facts.runtimeSkipped = `進入點腳本抓不到（${entry.error}），本輪未判定正式站是否載入 PostHog。`;
+    } else {
+      const contentType = entry.headers.get("content-type") ?? "";
+      const looksLikeJs = /javascript|ecmascript|text\/plain/i.test(contentType) || entry.status === 200;
+      const entryComplete = !entry.truncated && entry.status === 200 && looksLikeJs;
+      const detected = detectPosthogInBundle(entry.body);
+      facts.posthog = { ...detected, entryComplete, truncated: entry.truncated, status: entry.status };
+      if (!entryComplete && !detected.present) {
+        facts.runtimeSkipped =
+          `進入點腳本未完整讀取（${entry.truncated ? "超過讀取上限" : `HTTP ${entry.status}`}），` +
+          "本輪無法判定正式站是否載入 PostHog——沒讀完就不能說裡面沒有。";
       }
+      findings.push(...analyzePosthogRuntime({ entryJs: entry.body, cspScriptSrc, entryComplete }, surface, entryUrl));
     }
   }
 

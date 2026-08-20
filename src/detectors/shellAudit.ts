@@ -7,7 +7,7 @@
  *
  * 每個分析函式都是純的（吃檔案內容字串），檔案 I/O 集中在 `checkShells`。
  */
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { finding } from "../core/findings.js";
 import { stopwatch } from "../core/findings.js";
@@ -26,11 +26,56 @@ export interface CapacitorFacts {
   allowNavigation: string[];
 }
 
+/**
+ * 剝除 JS／TS 註解。
+ *
+ * 沒有這道，被註解掉的本機開發設定會被當成正式設定回報：
+ * `// url: "http://192.168.1.10:5173"` 與 `// cleartext: true` 是 Capacitor 設定檔裡
+ * 極常見的寫法（切換本機／正式時整行註解掉），而稽核會照單全收，一次噴出三四筆 critical。
+ * 那種假警報比漏報更傷——讀者第一次發現報告在說謊之後，就不會再讀第二份了。
+ *
+ * 行註解只吃「整行以空白＋// 開頭」的形式，刻意不處理行尾註解：
+ * 要正確判斷行尾的 `//` 得先知道它在不在字串裡，而錯判會把 `https://` 從中間切斷，
+ * 反而製造出更難查的錯誤。行尾註解由下面的「取區塊內第一個匹配」來擋。
+ */
+export function stripJsComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+}
+
+/**
+ * 取出某個鍵底下的區塊內容（大括號配對）。
+ *
+ * 為什麼要限定區塊：舊版直接在整份檔案裡找第一個 `url:`，於是 plugins 設定裡任何一個
+ * `url` 都可能被誤認成 `server.url`——判定的對象根本不是 App 實際會載入的網址。
+ *
+ * 字串裡若含大括號會讓配對失準，但設定檔的 URL 與 scheme 不會出現大括號，
+ * 為此引入一個 JS 解析器並不划算。
+ */
+function extractBlock(source: string, key: string): string | null {
+  const opener = new RegExp(`(?:^|[\\s,{])${key}\\s*:\\s*\\{`).exec(source);
+  if (!opener) return null;
+  const start = opener.index + opener[0].length - 1;
+  let depth = 0;
+  for (let i = start; i < source.length; i += 1) {
+    if (source[i] === "{") depth += 1;
+    else if (source[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start + 1, i);
+    }
+  }
+  return null;
+}
+
 export function parseCapacitorConfig(source: string): CapacitorFacts {
-  const serverUrl = /url\s*:\s*["'`]([^"'`]+)["'`]/.exec(source)?.[1] ?? null;
-  const androidScheme = /androidScheme\s*:\s*["'`]([^"'`]+)["'`]/.exec(source)?.[1] ?? null;
-  const cleartext = /cleartext\s*:\s*true/.test(source);
-  const navBlock = /allowNavigation\s*:\s*\[([^\]]*)\]/s.exec(source)?.[1] ?? "";
+  const clean = stripJsComments(source);
+  // server 區塊找不到時退回整份檔案：有些專案把設定拆檔或用展開運算子，
+  // 退回全檔的漏報風險，低於「完全不看」。
+  const scope = extractBlock(clean, "server") ?? clean;
+
+  const serverUrl = /(?:^|[\s,{])url\s*:\s*["'`]([^"'`]+)["'`]/.exec(scope)?.[1] ?? null;
+  const androidScheme = /(?:^|[\s,{])androidScheme\s*:\s*["'`]([^"'`]+)["'`]/.exec(scope)?.[1] ?? null;
+  const cleartext = /(?:^|[\s,{])cleartext\s*:\s*true/.test(scope);
+  const navBlock = /(?:^|[\s,{])allowNavigation\s*:\s*\[([^\]]*)\]/s.exec(scope)?.[1] ?? "";
   const allowNavigation = [...navBlock.matchAll(/["'`]([^"'`]+)["'`]/g)].map((m) => m[1] as string);
   return { serverUrl, androidScheme, cleartext, allowNavigation };
 }
@@ -128,18 +173,40 @@ export interface ManifestFacts {
   permissions: string[];
   deepLinkHosts: string[];
   hasNetworkSecurityConfig: boolean;
+  /** 這份 XML 有沒有被讀懂。false 代表稽核結果不可信，必須說出來而不是回報零發現。 */
+  looksParseable: boolean;
+}
+
+/**
+ * 布林屬性的比對式。
+ *
+ * 兩件事都是為了避免靜默漏判：
+ * - 引號用反向參照鎖定成對——XML 規格裡單引號與雙引號完全等價，只認雙引號會讓
+ *   `android:debuggable='true'` 這種合法寫法整份稽核靜默回空。
+ * - 命名空間前綴放寬——多數專案用 `android:`，但前綴是可以自訂的。
+ */
+function boolAttr(name: string): RegExp {
+  return new RegExp(`(?:[\\w-]+:)?${name}\\s*=\\s*(["'])(true|false)\\1`, "i");
 }
 
 export function parseAndroidManifest(xml: string): ManifestFacts {
-  const cleartextRaw = /android:usesCleartextTraffic\s*=\s*"(true|false)"/.exec(xml)?.[1];
-  const allowBackupRaw = /android:allowBackup\s*=\s*"(true|false)"/.exec(xml)?.[1];
+  // XML 註解必須先剝除：被註解起來的 <uses-permission> 是 manifest 裡最常見的寫法
+  // （「之後要做相機上傳再打開」），照收會憑空生出多餘權限的告警。
+  const clean = xml.replace(/<!--[\s\S]*?-->/g, "");
+
+  const cleartextRaw = boolAttr("usesCleartextTraffic").exec(clean)?.[2];
+  const allowBackupRaw = boolAttr("allowBackup").exec(clean)?.[2];
+  const debuggableRaw = boolAttr("debuggable").exec(clean)?.[2];
   return {
-    cleartextTraffic: cleartextRaw === undefined ? null : cleartextRaw === "true",
-    debuggable: /android:debuggable\s*=\s*"true"/.test(xml),
-    allowBackup: allowBackupRaw === undefined ? null : allowBackupRaw === "true",
-    permissions: [...xml.matchAll(/<uses-permission[^>]+android:name\s*=\s*"([^"]+)"/g)].map((m) => m[1] as string),
-    deepLinkHosts: [...xml.matchAll(/<data[^>]+android:host\s*=\s*"([^"]+)"/g)].map((m) => m[1] as string),
-    hasNetworkSecurityConfig: /android:networkSecurityConfig\s*=/.test(xml),
+    cleartextTraffic: cleartextRaw === undefined ? null : cleartextRaw.toLowerCase() === "true",
+    debuggable: debuggableRaw?.toLowerCase() === "true",
+    allowBackup: allowBackupRaw === undefined ? null : allowBackupRaw.toLowerCase() === "true",
+    permissions: [...clean.matchAll(/<uses-permission[^>]+?android:name\s*=\s*(["'])([^"']+)\1/g)].map((m) => m[2] as string),
+    deepLinkHosts: [...clean.matchAll(/<data[^>]+?android:host\s*=\s*(["'])([^"']+)\1/g)].map((m) => m[2] as string),
+    hasNetworkSecurityConfig: /(?:[\w-]+:)?networkSecurityConfig\s*=/.test(clean),
+    // 連一個 manifest 元素都找不到＝這份 XML 沒被讀懂。此時「零發現」的意思是「沒看懂」，
+    // 不是「沒問題」，所以要能讓 analyzeManifest 把它講出來。
+    looksParseable: /<(?:manifest|application|uses-permission)[\s>/]/i.test(clean),
   };
 }
 
@@ -158,6 +225,26 @@ const SENSITIVE_PERMISSIONS = new Set([
 
 export function analyzeManifest(facts: ManifestFacts, where: string): Finding[] {
   const out: Finding[] = [];
+
+  // 沒讀懂就不要再產生任何基於誤讀的判定。這裡直接收工，理由與 health 的
+  // 「連不上就別產生次生告警」同源：從錯誤的前提推出來的結論，比沒有結論更糟。
+  if (!facts.looksParseable) {
+    out.push(
+      finding({
+        ...base,
+        id: "shell.android.unparseable",
+        severity: "low",
+        title: "AndroidManifest.xml 沒有被讀懂，Android 殼層未稽核",
+        detail:
+          "這份檔案裡找不到任何 manifest 元素（<manifest>／<application>／<uses-permission>），代表解析失敗" +
+          "（格式特殊、被前處理過，或根本不是 manifest）。" +
+          "本輪沒有對 debuggable、明文流量、備份與權限做出任何判定——沒有發現不等於沒有問題。",
+        remediation: "確認 --repo 指向的是 ai_os 原始碼樹，且 android/app/src/main/AndroidManifest.xml 是完整的 manifest。",
+        where,
+      }),
+    );
+    return out;
+  }
 
   if (facts.cleartextTraffic === true) {
     out.push(
@@ -259,6 +346,59 @@ export function parseTauriConfig(json: string): TauriFacts | null {
   };
 }
 
+/**
+ * 放寬 JSON5 的兩個常見語法：註解與尾逗號。
+ *
+ * Tauri v2 的 capability 檔官方就支援 JSON5，所以帶行內註解的能力檔完全合法。
+ * 用 JSON.parse 直接失敗然後靜默略過，等於對「那一份可能寫著 remote.urls: ["*"] 的檔案」視而不見。
+ */
+function relaxJson5(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^[ \t]*\/\/.*$/gm, "")
+    .replace(/,(\s*[}\]])/g, "$1");
+}
+
+/**
+ * 解析一份 capability 檔。
+ *
+ * 一個檔案可以是單一能力物件，也可以是能力陣列（Tauri 兩種都吃）。
+ * 完全解析不出來時回 null——由呼叫端產生「無法稽核」的發現，而不是當作這個檔案不存在。
+ */
+export function parseCapabilityFile(source: string): TauriCapability[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    try {
+      parsed = JSON.parse(relaxJson5(source));
+    } catch {
+      return null;
+    }
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  return Array.isArray(parsed) ? (parsed as TauriCapability[]) : [parsed as TauriCapability];
+}
+
+/**
+ * 能力授權的網域範圍。
+ *
+ * 這三級不能混為一談：
+ * - `whole-web`：`*`、`https://*`、以及 host 位置就是萬用的寫法——對整個網際網路開放，
+ *   任何頁面都能呼叫本機能力。
+ * - `subdomain-wildcard`：`https://*.你的網域` 加上路徑萬用——綁在一個具體的註冊網域上。仍然過寬
+ *   （閒置子網域被接管是真實的攻擊路徑），但把它報成「對任意網域開放」是錯的，
+ *   而錯誤的 critical 會讓人把整組告警關掉。
+ * - `specific`：host 寫死、只有路徑用萬用——那是正常寫法，不報。
+ */
+export function classifyCapabilityScope(url: string): "whole-web" | "subdomain-wildcard" | "specific" {
+  if (url === "*") return "whole-web";
+  // host 位置緊接著就是 *：後面沒有東西、或接的是 /、: 、以及 *.* 這種等同全開的寫法。
+  if (/^https?:\/\/\*(?:[/:]|$)/.test(url) || /^https?:\/\/\*\.\*/.test(url)) return "whole-web";
+  if (/^https?:\/\/\*\.[^/*]+/.test(url)) return "subdomain-wildcard";
+  return "specific";
+}
+
 export function analyzeTauri(facts: TauriFacts, capabilities: TauriCapability[], where: string): Finding[] {
   const out: Finding[] = [];
 
@@ -325,9 +465,8 @@ export function analyzeTauri(facts: TauriFacts, capabilities: TauriCapability[],
   for (const cap of capabilities) {
     const urls = cap.remote?.urls ?? [];
     for (const url of urls) {
-      // `https://example.com/*` 是正常的路徑萬用；`*` 或 `https://*` 才是危險的
-      const isWholeWeb = url === "*" || /^https?:\/\/\*/.test(url) || url === "https://*/*";
-      if (isWholeWeb) {
+      const scope = classifyCapabilityScope(url);
+      if (scope === "whole-web") {
         out.push(
           finding({
             ...base,
@@ -337,6 +476,20 @@ export function analyzeTauri(facts: TauriFacts, capabilities: TauriCapability[],
             detail:
               "任何被載入視窗的網站都能呼叫這組本機能力。只要使用者被導到惡意頁面（或站台被注入），本機檔案橋接就落入攻擊者手中。",
             remediation: "把 remote.urls 收斂成正式站的完整來源（例如 https://你的網域/*）。",
+            where,
+          }),
+        );
+      } else if (scope === "subdomain-wildcard") {
+        out.push(
+          finding({
+            ...base,
+            id: `shell.tauri.capability-subdomain.${cap.identifier ?? "unknown"}`,
+            severity: "medium",
+            title: `Tauri 能力「${cap.identifier ?? "未命名"}」對整個網域的所有子網域開放（${url}）`,
+            detail:
+              "授權範圍綁在一個具體的註冊網域上，不是整個網際網路——所以這不是全開。但只要任何一個子網域" +
+              "（預覽站、文件站、被接管的閒置子網域）能載入內容，它就握有這組本機能力。",
+            remediation: "把 remote.urls 收斂成實際會被載入的那一個來源，而不是整個網域的萬用。",
             where,
           }),
         );
@@ -518,18 +671,69 @@ export async function checkShells(repoPath: string | undefined, target: string):
       );
     } else {
       facts.tauri = tauriFacts;
-      // capabilities 是獨立檔案，逐一讀取
-      const capabilities: TauriCapability[] = [];
-      for (const name of ["remote-main.json", "default.json", "main.json"]) {
-        const capSrc = await readIfExists(path.join(repoPath, "src-tauri/capabilities", name));
-        if (!capSrc) continue;
-        try {
-          capabilities.push(JSON.parse(capSrc) as TauriCapability);
-        } catch {
-          /* 壞掉的 capability 檔在 Tauri 建置時就會爆，這裡不重複報 */
-        }
+
+      // capabilities 是獨立檔案。**必須列目錄，不能猜檔名**：Tauri v2 是把
+      // src-tauri/capabilities/ 底下的每一個檔案都讀進來，識別靠檔案裡的 identifier 而非檔名。
+      // 舊版只試三個寫死的名字，於是一份叫 remote.json、內容寫著 remote.urls: ["*"] 的能力檔
+      // 會被完全跳過——稽核結果是「零發現」，而桌面端其實對整個網際網路開放本機能力。
+      const capDir = path.join(repoPath, "src-tauri/capabilities");
+      let capNames: string[] = [];
+      try {
+        capNames = (await readdir(capDir)).filter((n) => /\.(json|json5|toml)$/i.test(n)).sort();
+      } catch {
+        /* 目錄不存在：這個專案沒有用 capability，不是問題 */
       }
+
+      const capabilities: TauriCapability[] = [];
+      const capabilityFiles: Array<{ file: string; status: string }> = [];
+      for (const name of capNames) {
+        const capSrc = await readIfExists(path.join(capDir, name));
+        if (capSrc === null) continue;
+
+        if (/\.toml$/i.test(name)) {
+          capabilityFiles.push({ file: name, status: "unaudited" });
+          findings.push(
+            finding({
+              ...base,
+              id: `shell.tauri.capability-unauditable.${name}`,
+              severity: "low",
+              title: `Tauri 能力檔 ${name} 是 TOML，本輪未稽核`,
+              detail:
+                "這個檔案定義了桌面端能開放哪些本機能力給哪些來源，但 TOML 需要額外的解析器，" +
+                "本工具刻意不引入。它的內容**沒有被檢查**——不是沒問題，是沒看過。",
+              remediation: "把能力檔改成 JSON（Tauri 兩種都吃），或人工確認其中的 remote.urls 沒有萬用授權。",
+              where: path.join(capDir, name),
+            }),
+          );
+          continue;
+        }
+
+        const parsed = parseCapabilityFile(capSrc);
+        if (parsed === null) {
+          capabilityFiles.push({ file: name, status: "unparseable" });
+          findings.push(
+            finding({
+              ...base,
+              id: `shell.tauri.capability-unparseable.${name}`,
+              severity: "low",
+              title: `Tauri 能力檔 ${name} 無法解析，本輪未稽核`,
+              detail:
+                "這個檔案定義了桌面端能開放哪些本機能力給哪些來源，解析失敗代表它的授權範圍沒有被檢查過。" +
+                "這與 tauri.conf.json 解析失敗一樣要說出來——靜默略過會讓報告的零發現變成謊話。",
+              remediation: "修正該檔的語法（JSON 或 JSON5 皆可）。",
+              where: path.join(capDir, name),
+            }),
+          );
+          continue;
+        }
+
+        capabilities.push(...parsed);
+        capabilityFiles.push({ file: name, status: "parsed" });
+      }
+
       facts.tauriCapabilities = capabilities;
+      // 「讀了哪些檔」要留下來：讓讀者能分辨「沒有能力檔」與「我沒找到能力檔」。
+      facts.tauriCapabilityFiles = capabilityFiles;
       findings.push(...analyzeTauri(tauriFacts, capabilities, tauriPath));
     }
   }

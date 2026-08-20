@@ -18,7 +18,15 @@ export interface ProbeResponse {
   body: string;
   truncated: boolean;
   durationMs: number;
-  /** Set-Cookie 原始值。Headers.get 會把多個 cookie 併成一行導致無法解析，故走 getSetCookie。 */
+  /**
+   * **整條重導向鏈上**的 Set-Cookie 原始值（依序）。
+   *
+   * 不是只有最終回應：express-session 的預設行為就是在第一個回應上種 cookie，
+   * 而那個回應常常正是 302。只取最終落點的話，站台真正的會話 Cookie 完全不會被稽核——
+   * 檢查照樣完成、照樣零發現。
+   *
+   * Headers.get 會把多個 cookie 併成一行導致無法解析，故走 getSetCookie。
+   */
   setCookies: string[];
 }
 
@@ -46,6 +54,12 @@ export class ProbeError extends Error {
 
 const DEFAULT_MAX_BODY = 512 * 1024;
 
+/** getSetCookie 在 Node 20+ 的 undici Headers 上可用；舊環境退回單行值。 */
+function readSetCookies(headers: Headers): string[] {
+  if (typeof headers.getSetCookie === "function") return headers.getSetCookie();
+  return [headers.get("set-cookie")].filter(Boolean) as string[];
+}
+
 /** 把 surface 人格（UA、殼層標頭）疊到請求上。呼叫端明確給的標頭優先。 */
 function headersFor(options: ProbeOptions): Record<string, string> {
   const base: Record<string, string> = {};
@@ -62,17 +76,36 @@ async function readBody(res: Response, maxBytes: number): Promise<{ body: string
   const chunks: Uint8Array[] = [];
   let size = 0;
   let truncated = false;
+  let finished = false;
   try {
-    while (size < maxBytes) {
+    while (!finished && size < maxBytes) {
       const { done, value } = await reader.read();
-      if (done) break;
+      finished = done;
+      if (done || !value) continue;
       chunks.push(value);
       size += value.byteLength;
     }
-    // 還沒讀完就達到上限：標記截斷並放棄剩餘串流，別讓大檔拖住整輪掃描。
-    if (size >= maxBytes) {
-      truncated = true;
-      await reader.cancel().catch(() => {});
+
+    // 達到上限時**再讀一次**，看串流是不是其實已經結束了。
+    //
+    // 判準必須是「串流還沒結束」，不能是「size 達到上限」——內容剛好等於上限（或一整包
+    // 在單一 chunk 送達）時，舊版會把一份一個 byte 都沒少的回應標成截斷。代價很具體：
+    // supply-chain 會據此回「首頁 HTML 超過讀取上限」並放棄整份子資源盤點，
+    // disclosure 則會宣告 source map 未驗證。一份完整的回應，換來一項沒做的檢查。
+    //
+    // 多讀的這一次最多只多拿一個 chunk，而且受同一個逾時保護。
+    if (!finished) {
+      const { done, value } = await reader.read();
+      if (done) {
+        finished = true;
+      } else {
+        truncated = true;
+        if (value) {
+          chunks.push(value);
+          size += value.byteLength;
+        }
+        await reader.cancel().catch(() => {});
+      }
     }
   } catch {
     // 讀到一半斷線：已讀到的部分仍有分析價值（例如 CSP meta 標籤就在 head）。
@@ -101,6 +134,7 @@ export async function probe(url: string, options: ProbeOptions = {}): Promise<Pr
   let current = url;
   let hops = 0;
   const startedAt = Date.now();
+  const setCookies: string[] = [];
 
   for (;;) {
     let res: Response;
@@ -123,6 +157,8 @@ export async function probe(url: string, options: ProbeOptions = {}): Promise<Pr
     if (isRedirect && hops < maxHops) {
       const next = new URL(location, current).toString();
       redirects.push({ from: current, to: next, status: res.status });
+      // 這一跳種下的 Cookie 要留著——會話 Cookie 常常就種在重導向那個回應上。
+      setCookies.push(...readSetCookies(res.headers));
       // 讀掉 body 避免連線洩漏；重導向的 body 對判定沒有價值。
       await res.body?.cancel().catch(() => {});
       current = next;
@@ -142,10 +178,7 @@ export async function probe(url: string, options: ProbeOptions = {}): Promise<Pr
       body,
       truncated,
       durationMs: Date.now() - startedAt,
-      // getSetCookie 在 Node 20+ 的 undici Headers 上可用；舊環境退回單行值。
-      setCookies: typeof res.headers.getSetCookie === "function"
-        ? res.headers.getSetCookie()
-        : ([res.headers.get("set-cookie")].filter(Boolean) as string[]),
+      setCookies: [...setCookies, ...readSetCookies(res.headers)],
     };
   }
 }

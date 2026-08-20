@@ -61,6 +61,16 @@ export interface CheckResult {
   facts?: Record<string, unknown>;
   /** 檢查自己爆掉（不是目標有問題，是檢測器有問題）——必須跟「發現問題」分開看。 */
   error?: string;
+  /**
+   * 這筆結果是**後製產生的**（抑制清單的提醒、基準檔讀取錯誤），不是真的跑了一項檢查。
+   *
+   * summary 的 completed／skipped／errored 一律排除它。否則會出現這種結局：
+   * 站台完全連不到、每一項檢查都被標記跳過（此時結束碼應該是 3「什麼都沒實際執行」），
+   * 但只要那一輪帶了 `--suppress`（CI 上是常態），抑制清單的「這條規則沒命中」提醒就會
+   * 生出一筆 completed 的結果，於是 completed 從 0 變成 1，exit 3 變成 exit 0——
+   * 一輪什麼都沒驗到的執行，在 CI 上顯示綠燈。
+   */
+  meta?: boolean;
 }
 
 export interface Surface {
@@ -94,6 +104,32 @@ export interface SentinelConfig {
   screenshots: boolean;
 }
 
+/**
+ * 一筆被抑制清單吃掉的發現。
+ *
+ * 抑制過的發現**仍然留在報告裡**，只是移出主清單。理由與「跳過不等於通過」同源：
+ * 一個被靜默刪掉的發現，半年後沒有人記得它存在過，也沒有人會重新檢視當初的決定。
+ */
+export interface SuppressedFindingRecord {
+  finding: Finding;
+  /** 抑制理由。抑制清單強制填寫——沒有理由的抑制就是隱藏。 */
+  reason: string;
+  /** 到期日；null 代表永久抑制（應該極少，報告會另外標示）。 */
+  expires: string | null;
+  owner: string | null;
+}
+
+/** 跨次執行比對。存量問題與新增問題必須分開看，否則報告很快就變成沒人讀的噪音牆。 */
+export interface ReportDiff {
+  /** 基準檔本身測的是哪個站、什麼時候測的——比對不同站台的結果會誤導人，要讓讀者看得到。 */
+  baselineTarget: string | null;
+  baselineStartedAt: string | null;
+  added: Finding[];
+  fixed: Finding[];
+  unchanged: Finding[];
+  changed: Array<{ key: string; before: Finding; after: Finding }>;
+}
+
 export interface RunReport {
   startedAt: string;
   finishedAt: string;
@@ -106,7 +142,18 @@ export interface RunReport {
     completed: number;
     skipped: number;
     errored: number;
+    /** 被抑制清單移出主清單的筆數。0 以外的值都應該被讀者看見。 */
+    suppressed: number;
     findings: Record<Severity, number>;
     worst: Severity | null;
   };
+  /** 有帶 `--baseline` 時的比對結果。 */
+  diff?: ReportDiff;
+  /** 被抑制的發現。抑制不等於不存在，所以它留在報告上。 */
+  suppressed?: SuppressedFindingRecord[];
+  /**
+   * 本次的檢查過濾條件。
+   * 有過濾就代表這份報告的涵蓋範圍被刻意縮小過——不寫出來，讀者會把它當成完整檢測。
+   */
+  filter?: { only: string[]; skip: string[] };
 }

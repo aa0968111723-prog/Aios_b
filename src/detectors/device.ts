@@ -24,8 +24,8 @@ export interface DeviceRecord {
   isMobile: boolean;
   hasTouch: boolean;
   extraHeaders: Record<string, string>;
-  /** 實測觀測到的回應狀態與 Vary 標頭。 */
-  observed?: { status: number; vary: string | null; contentType: string | null };
+  /** 實測觀測到的回應狀態與 Vary 標頭；連不上時 status 為 0 並附上原因。 */
+  observed?: { status: number; vary: string | null; contentType: string | null; error?: string };
 }
 
 /** 把一個 surface 轉成裝置紀錄（未含實測觀測值）。 */
@@ -103,24 +103,30 @@ export async function checkDevice(surfaces: Surface[], timeoutMs: number): Promi
   const findings: Finding[] = [];
   const meta = { ...base, surface: "all" as const };
 
+  // 帳本要涵蓋**每一個受測端**，包含連不上的那些。
+  //
+  // 舊版只把成功的端放進 records，於是三端裡兩端連不上時，帳本只剩一筆、檢查照樣回
+  // completed: true。這個檢查唯一的產出就是「我們當時是以什麼裝置在測」——帳本悄悄少掉兩端，
+  // 等於報告在回答那個問題時說了謊。
   const records: DeviceRecord[] = [];
-  const statuses: number[] = [];
-
-  // 先各發一次請求，收集每端觀測到的狀態（供跨端比對）。
   const probed: Array<{ record: DeviceRecord; status: number; vary: string | null }> = [];
+  const unreachable: string[] = [];
+
   for (const surface of surfaces) {
     const record = deviceRecordOf(surface);
     findings.push(...analyzePersonaConsistency(record));
+    records.push(record);
+
     const res = await tryProbe(surface.origin, { surface, timeoutMs, followRedirects: 2 });
     if (isProbeFailure(res)) {
+      record.observed = { status: 0, vary: null, contentType: null, error: res.error };
+      unreachable.push(surface.id);
       probed.push({ record, status: 0, vary: null });
       continue;
     }
     const vary = res.headers.get("vary");
     record.observed = { status: res.status, vary, contentType: res.headers.get("content-type") };
-    statuses.push(res.status);
     probed.push({ record, status: res.status, vary });
-    records.push(record);
   }
 
   for (const p of probed) {
@@ -128,13 +134,36 @@ export async function checkDevice(surfaces: Surface[], timeoutMs: number): Promi
     findings.push(...analyzeDeviceResponse({ record: p.record, status: p.status, vary: p.vary, peerStatuses }));
   }
 
+  const observedCount = probed.length - unreachable.length;
+
+  // 部分端沒被觀測到，要在發現清單上留下痕跡。帳本裡有那筆紀錄，但 observed.status 為 0——
+  // 而讀者不會逐筆去看 facts，只會看發現清單。
+  for (const id of unreachable) {
+    const record = records.find((r) => r.surface === id);
+    findings.push(
+      finding({
+        ...base,
+        surface: id as Finding["surface"],
+        id: `device.unobserved.${id}`,
+        severity: "low",
+        title: `${record?.label ?? id}：這一端沒有被觀測到`,
+        detail:
+          `以這個裝置人格請求站台失敗（${record?.observed?.error ?? "原因不明"}）。` +
+          "裝置紀錄裡留有它的人格，但沒有實測回應——跨端比對也因此缺了這一端，" +
+          "「只有某個裝置被擋下」這類問題本輪對它無從判定。",
+        remediation: "確認該端的 target 設定正確且從此網路環境連得到；三端應指向同一個部署，除非刻意分開。",
+        evidence: record?.observed?.error ?? undefined,
+      }),
+    );
+  }
+
   return {
     ...meta,
-    completed: records.length > 0,
-    skippedReason: records.length === 0 ? "所有裝置都連不到站台，無法建立裝置紀錄。" : undefined,
+    completed: observedCount > 0,
+    skippedReason: observedCount === 0 ? "所有裝置都連不到站台，無法建立裝置紀錄。" : undefined,
     durationMs: elapsed(),
     findings,
     // 裝置紀錄：報告 JSON 會原樣保留，作為「本次以什麼裝置測」的稽核憑據。
-    facts: { deviceLedger: records },
+    facts: { deviceLedger: records, unobserved: unreachable },
   };
 }

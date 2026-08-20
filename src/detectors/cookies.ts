@@ -30,11 +30,69 @@ export function parseSetCookie(raw: string): ParsedCookie | null {
   return { name, value: first.slice(eq + 1).trim(), attributes };
 }
 
-/** 名字看起來像會話／憑證的 Cookie。命名慣例涵蓋 express-session、自建 sid、JWT。 */
-const SESSION_NAME = /(^|[._-])(sid|sess|session|token|auth|jwt|csrf|refresh)([._-]|$)/i;
+/**
+ * 會話／憑證類的字根。
+ *
+ * 這份判定決定同一個缺陷是 critical 還是 low，所以它漏判的代價很具體：
+ * 一個沒有 HttpOnly 的登入憑證會被標成「低風險的偏好設定」，然後沒有人去修。
+ */
+const SESSION_WORDS = new Set(["sid", "sess", "session", "token", "auth", "jwt", "csrf", "xsrf", "refresh"]);
 
+/**
+ * 沒有任何分隔符、但業界慣例就是會話 Cookie 的名字。
+ *
+ * 這些名字沒辦法靠斷詞認出來（`csrftoken` 拆不開），但它們是各框架的預設值，
+ * 出現機率遠高於任何巧合，值得單獨列出。
+ */
+const SESSION_NAMES = new Set([
+  "csrftoken",
+  "jsessionid",
+  "phpsessid",
+  "sessionid",
+  "accesstoken",
+  "refreshtoken",
+  "idtoken",
+  "xsrftoken",
+  "authtoken",
+]);
+
+/** camelCase／PascalCase 斷詞：`authToken` → `auth` + `Token`，`XSRFToken` → `XSRF` + `Token`。 */
+function splitCamel(word: string): string[] {
+  return word
+    .replace(/([a-z0-9])([A-Z])/g, "$1\u0000$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1\u0000$2")
+    .split("\u0000");
+}
+
+/**
+ * 名字看起來像會話／憑證的 Cookie。
+ *
+ * 斷詞而不是子字串比對：子字串會讓 `authorship`、`tokenizer` 這種名字誤中，
+ * 而純分隔符比對（舊作法）則會漏掉 `authToken`、`sessionToken` 這類駝峰命名——
+ * 後者正是 JS 生態最常見的寫法，漏掉它等於把最該抓的那類 Cookie 放掉。
+ *
+ * `__Host-` 與 `__Secure-` 前綴先剝掉：那是瀏覽器的安全前綴，不是名字的一部分。
+ */
 export function looksLikeSessionCookie(name: string): boolean {
-  return SESSION_NAME.test(name);
+  const stripped = name.replace(/^__(Host|Secure)-/i, "");
+  if (SESSION_NAMES.has(stripped.toLowerCase())) return true;
+  return stripped
+    .split(/[^A-Za-z0-9]+/)
+    .flatMap(splitCamel)
+    .some((word) => SESSION_WORDS.has(word.toLowerCase()));
+}
+
+/**
+ * 值本身就是憑證的證據。
+ *
+ * 名字可以任意取（`_aios_k` 一樣可以裝著 JWT），所以除了看名字，也看值長什麼樣。
+ * 但只認**明確無歧義**的兩種格式：JWT 與 express `cookie-parser` 的簽章前綴。
+ * 不用「夠長就算」這種門檻——`_ga` 之類的分析 Cookie 也又長又亂，
+ * 那條規則會把一批本來就必須讓 JS 讀得到的 Cookie 全部誤報成 critical。
+ */
+export function looksLikeCredentialValue(value: string): boolean {
+  if (/^s(?::|%3A)/i.test(value)) return true; // express cookie-parser 的簽章 Cookie
+  return /^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(value); // JWT（header 必為 {"alg"…）
 }
 
 export interface CookieContext {
@@ -50,7 +108,7 @@ export function analyzeCookies(setCookies: string[], ctx: CookieContext): Findin
   for (const raw of setCookies) {
     const cookie = parseSetCookie(raw);
     if (!cookie) continue;
-    const isSession = looksLikeSessionCookie(cookie.name);
+    const isSession = looksLikeSessionCookie(cookie.name) || looksLikeCredentialValue(cookie.value);
     const attrs = cookie.attributes;
     // 屬性值本身可能含憑證，證據只保留名稱與屬性清單。
     const evidence = `${cookie.name}; ${[...attrs.keys()].join("; ") || "（無屬性）"}`;

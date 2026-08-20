@@ -99,3 +99,43 @@ describe("analyzeDbExposure", () => {
     expect(analyzeDbExposure({ clientReferencesDbUrl: false, publicStudioRoute: null })).toEqual([]);
   });
 });
+
+/**
+ * 間歇逾時：這個模組的檔頭一開始就宣稱要抓「連線池耗盡的典型症狀」，
+ * 但舊版只判「全數逾時」。3 次取樣有 2 次連不上時，報告是「檢查完成、零發現」——
+ * 而間歇比全數更難查，因為健康檢查與人工重試常常剛好落在成功的那幾次。
+ */
+describe("analyzeDbTraffic — 間歇逾時", () => {
+  it("有些成功、有些逾時＝high，不是零發現", () => {
+    const { findings } = analyzeDbTraffic(
+      [sample({ unreachable: true, ok: null, dbOk: null, latencyMs: 0 }), sample({ latencyMs: 120 }), sample({ unreachable: true, ok: null, dbOk: null, latencyMs: 0 })],
+      web,
+    );
+    const hit = findings.find((f) => f.id === "db.ready-intermittent");
+    expect(hit?.severity).toBe("high");
+    expect(hit?.evidence).toContain("2/3");
+  });
+
+  it("全部逾時仍走 db.ready-timeout，不會變成間歇", () => {
+    const { findings } = analyzeDbTraffic(
+      [sample({ unreachable: true, ok: null, dbOk: null, latencyMs: 0 }), sample({ unreachable: true, ok: null, dbOk: null, latencyMs: 0 })],
+      web,
+    );
+    expect(ids(findings)).toContain("db.ready-timeout");
+    expect(ids(findings)).not.toContain("db.ready-intermittent");
+  });
+
+  it("全部成功且不慢時零發現", () => {
+    const { findings } = analyzeDbTraffic([sample({ latencyMs: 80 }), sample({ latencyMs: 90 })], web);
+    expect(findings).toEqual([]);
+  });
+
+  it("間歇逾時與偏慢可以同時成立——兩件事都值得說", () => {
+    const { findings } = analyzeDbTraffic(
+      [sample({ unreachable: true, ok: null, dbOk: null, latencyMs: 0 }), sample({ latencyMs: 4000 })],
+      web,
+    );
+    expect(ids(findings)).toContain("db.ready-intermittent");
+    expect(ids(findings)).toContain("db.slow-roundtrip");
+  });
+});
