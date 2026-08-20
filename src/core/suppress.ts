@@ -142,9 +142,13 @@ export function expiryInstant(expires: string): number | null {
  *
  * 沒有 `expires` 是永久抑制（回 false，另外用 `suppress.no-expiry` 提醒）；
  * 有 `expires` 卻解析不出日期時視同已過期——看不懂的日期不可以變成永久抑制。
+ *
+ * 判斷「有沒有寫」用 `undefined` 而不是真假值：`expires: ""` 是**寫了但寫壞了**，
+ * 落到永久抑制那一側等於讓一個空字串換到無限期的靜音，正好是這份實作最想避免的事。
+ * 解析走 `expiryInstant`，所以空字串會照「看不懂的日期」處理——視同已過期。
  */
 export function isExpired(rule: SuppressionRule, now: Date): boolean {
-  if (!rule.expires) return false;
+  if (rule.expires === undefined) return false;
   const at = expiryInstant(rule.expires);
   return at === null || at < now.getTime();
 }
@@ -172,71 +176,95 @@ function validateExpires(value: string): string | null {
 }
 
 /**
+ * 退件時附上的「規則回音」——只求讓讀者認得出是哪一條，不是一條可以套用的規則。
+ *
+ * 為什麼值得做：呼叫端（`annotate.ts`）用 `problem.rule?.id` 組出 `suppress.invalid-rule.*`
+ * 的發現 id，認不出來時只能退回「第 N 筆」。而 N 是這筆在清單裡的位置——在清單最前面
+ * 插一條新規則，同一個錯誤就換了一個 id，跨次執行比對會把它報成「舊的修好了、又多一個新的」。
+ * id 必須跟著規則走，不能跟著行號走。
+ *
+ * `reason` 缺漏時填「（未填寫）」而不是空字串：這個物件可能被原樣印進報告，
+ * 空白一格會被讀成「沒事」，而事實是這條規則根本沒生效。
+ */
+function echoRule(entry: Record<string, unknown>): SuppressionRule | null {
+  const id = typeof entry.id === "string" ? entry.id.trim() : "";
+  if (id.length === 0) return null;
+  const hasReason = typeof entry.reason === "string" && !isBlank(entry.reason);
+  return { id, reason: hasReason ? (entry.reason as string).trim() : "（未填寫）" };
+}
+
+/** 單筆驗證的結果。壞的那筆也要帶回規則回音，理由見 `echoRule`。 */
+type RuleCheck =
+  | { ok: true; rule: SuppressionRule }
+  | { ok: false; rule: SuppressionRule | null; message: string };
+
+/**
  * 逐筆驗證一則規則。
  *
  * 未知欄位一律拒收，看起來嚴苛，但這裡的拼字錯誤會直接改變判定：把 `expires` 打成
  * `expiry`，規則會安靜地變成永久抑制，而且沒有任何跡象。寧可當場退件。
  */
-function validateRule(raw: unknown, index: number): { rule: SuppressionRule } | { message: string } {
+function validateRule(raw: unknown, index: number): RuleCheck {
   const at = `第 ${index + 1} 筆規則`;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    return { message: `${at}不是物件。` };
+    return { ok: false, rule: null, message: `${at}不是物件。` };
   }
   const entry = raw as Record<string, unknown>;
+  const reject = (message: string): RuleCheck => ({ ok: false, rule: echoRule(entry), message });
 
   for (const key of Object.keys(entry)) {
     if (!RULE_KEYS.includes(key as (typeof RULE_KEYS)[number])) {
-      return { message: `${at}含未知欄位「${key}」。可用欄位只有 ${RULE_KEYS.join("、")}；欄位打錯不能當成沒寫（expires 打成 expiry 會靜靜變成永久抑制）。` };
+      return reject(`${at}含未知欄位「${key}」。可用欄位只有 ${RULE_KEYS.join("、")}；欄位打錯不能當成沒寫（expires 打成 expiry 會靜靜變成永久抑制）。`);
     }
   }
 
   if (typeof entry.id !== "string" || isBlank(entry.id)) {
-    return { message: `${at}缺少 id。` };
+    return reject(`${at}缺少 id。`);
   }
   const id = entry.id.trim();
   const idProblem = validateIdPattern(id);
-  if (idProblem) return { message: `${at}的 id「${id}」${idProblem}` };
+  if (idProblem) return reject(`${at}的 id「${id}」${idProblem}`);
 
   if (typeof entry.reason !== "string" || isBlank(entry.reason)) {
-    return {
-      message: `${at}（${id}）缺少 reason。沒有理由的抑制就是隱藏——半年後沒人知道當初為什麼關掉，也沒人敢打開。`,
-    };
+    return reject(
+      `${at}（${id}）缺少 reason。沒有理由的抑制就是隱藏——半年後沒人知道當初為什麼關掉，也沒人敢打開。`,
+    );
   }
 
   const rule: SuppressionRule = { id, reason: entry.reason.trim() };
 
   if (entry.where !== undefined) {
     if (typeof entry.where !== "string" || isBlank(entry.where)) {
-      return { message: `${at}（${id}）的 where 必須是非空字串。` };
+      return reject(`${at}（${id}）的 where 必須是非空字串。`);
     }
     rule.where = entry.where.trim();
   }
 
   if (entry.expires !== undefined) {
     if (typeof entry.expires !== "string" || isBlank(entry.expires)) {
-      return { message: `${at}（${id}）的 expires 必須是非空字串。` };
+      return reject(`${at}（${id}）的 expires 必須是非空字串。`);
     }
     const expires = entry.expires.trim();
     const expiresProblem = validateExpires(expires);
-    if (expiresProblem) return { message: `${at}（${id}）的 expires「${expires}」${expiresProblem}` };
+    if (expiresProblem) return reject(`${at}（${id}）的 expires「${expires}」${expiresProblem}`);
     rule.expires = expires;
   }
 
   if (entry.owner !== undefined) {
     if (typeof entry.owner !== "string" || isBlank(entry.owner)) {
-      return { message: `${at}（${id}）的 owner 必須是非空字串。` };
+      return reject(`${at}（${id}）的 owner 必須是非空字串。`);
     }
     rule.owner = entry.owner.trim();
   }
 
   if (entry.acknowledgeCritical !== undefined) {
     if (typeof entry.acknowledgeCritical !== "boolean") {
-      return { message: `${at}（${id}）的 acknowledgeCritical 必須是布林值 true／false。` };
+      return reject(`${at}（${id}）的 acknowledgeCritical 必須是布林值 true／false。`);
     }
     if (entry.acknowledgeCritical) rule.acknowledgeCritical = true;
   }
 
-  return { rule };
+  return { ok: true, rule };
 }
 
 /**
@@ -299,8 +327,8 @@ export function parseSuppressions(json: string): { rules: SuppressionRule[]; pro
 
   entries.forEach((raw, index) => {
     const result = validateRule(raw, index);
-    if ("rule" in result) rules.push(result.rule);
-    else problems.push({ rule: null, raw, message: result.message });
+    if (result.ok) rules.push(result.rule);
+    else problems.push({ rule: result.rule, raw, message: result.message });
   });
 
   return { rules, problems };
@@ -351,10 +379,10 @@ function criticalAckNote(rule: SuppressionRule, blocked: Finding[]): Finding {
     id: "suppress.critical-requires-ack",
     severity: "medium",
     where: ruleLocation(rule),
-    title: "抑制規則想蓋掉 critical 發現，但沒有明示承認",
+    title: `抑制規則想蓋掉 ${blocked.length} 筆 critical 發現，但沒有明示承認`,
     detail:
       `規則 ${rule.id} 命中了 critical 等級的發現（${listIds(blocked)}）。critical 的定義是「現在就在外洩資料或可被接管」，` +
-      "這種等級不接受順手加一條規則就靜音——因此本次不套用，該筆發現照常回報。",
+      "這種等級不接受順手加一條規則就靜音——因此這幾筆不套用，仍然照常出現在主清單上。",
     remediation:
       '確定要承擔風險就在規則加上 "acknowledgeCritical": true，並補上 owner 與 expires，讓這個決定留下名字與期限；否則請直接修掉問題。',
     evidence: describeRule(rule),

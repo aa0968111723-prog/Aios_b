@@ -193,7 +193,6 @@ function formatSamples(samples: RateLimitSample[]): string {
  *
  * 只有呼叫端真的送過兩種帳號才有素材，否則一律不報——把「沒送過」講成「沒問題」，
  * 跟把「沒測到」講成「沒問題」是同一個錯誤。
- * 429 之後的回應要排除：那時候擋人的是限制器，與帳號存在與否無關。
  */
 function analyzeEnumeration(
   samples: RateLimitSample[],

@@ -101,14 +101,40 @@ describe("detectPosthogInBundle / analyzePosthogRuntime", () => {
   });
 
   it("正式站沒載 PostHog＝high（事件會靜默全掉）", () => {
-    const findings = analyzePosthogRuntime({ entryJs: "console.log('no analytics here')", cspScriptSrc: null }, web, "app.js");
+    const findings = analyzePosthogRuntime(
+      { entryJs: "console.log('no analytics here')", cspScriptSrc: null, entryComplete: true },
+      web,
+      "app.js",
+    );
     expect(ids(findings)).toEqual(["analytics.posthog.not-loaded"]);
     expect(findings[0]!.severity).toBe("high");
   });
 
+  // entry chunk 動輒數 MB，而 probe 有讀取上限。沒讀完就不能說裡面沒有 PostHog——
+  // 猜一個 high 出來，比沉默更糟：那是報告裡最像真問題的一種假警報。
+  it("bundle 沒讀完整時不報「未載入」", () => {
+    const findings = analyzePosthogRuntime(
+      { entryJs: "console.log('前 512KB 裡剛好沒有')", cspScriptSrc: null, entryComplete: false },
+      web,
+      "app.js",
+    );
+    expect(findings).toEqual([]);
+  });
+
+  // 「這份政策沒有規範腳本來源」與「script-src 明確不含 PostHog」是兩件事。
+  // 混為一談的話，`frame-ancestors 'none'` 這種單指令政策會讓分析被判成擋掉。
+  it("CSP 沒有可據以判定的來源清單時不報被擋", () => {
+    const findings = analyzePosthogRuntime(
+      { entryJs: `api_host:"https://us.posthog.com"`, cspScriptSrc: null, entryComplete: true },
+      web,
+      "app.js",
+    );
+    expect(findings).toEqual([]);
+  });
+
   it("有載但 CSP 沒放行 PostHog＝high（被瀏覽器擋掉）", () => {
     const findings = analyzePosthogRuntime(
-      { entryJs: `api_host:"https://us.posthog.com"`, cspScriptSrc: ["'self'"] },
+      { entryJs: `api_host:"https://us.posthog.com"`, cspScriptSrc: ["'self'"], entryComplete: true },
       web,
       "app.js",
     );
@@ -117,7 +143,7 @@ describe("detectPosthogInBundle / analyzePosthogRuntime", () => {
 
   it("有載且 CSP 放行 https://*.posthog.com＝無發現", () => {
     const findings = analyzePosthogRuntime(
-      { entryJs: `api_host:"https://us.posthog.com"`, cspScriptSrc: ["'self'", "https://*.posthog.com"] },
+      { entryJs: `api_host:"https://us.posthog.com"`, cspScriptSrc: ["'self'", "https://*.posthog.com"], entryComplete: true },
       web,
       "app.js",
     );

@@ -62,11 +62,17 @@ export interface BaselineSnapshot {
    *
    * 與本次 target 不同時**照樣比對**（拿 staging 比 production 有時正是想看的事），
    * 但呼叫端必須把它顯示出來——不然讀者會把兩個站之間的差異當成「這次改壞了」。
+   *
+   * 實務上還有一件更刺眼的事要先知道：多數發現的 `where` 是完整網址，站台一換就整串不同，
+   * 於是同一個問題會同時算進「新增」與「已修復」，`--fail-on-new` 也會因此整片變紅。
+   * 這不是誤判，是拿兩個站硬比的必然結果——所以跨站台的基準只適合當參考，不適合當關卡。
    */
   target: string | null;
 }
 
 const SEVERITIES = new Set<string>(["critical", "high", "medium", "low", "info"]);
+const CATEGORIES = new Set<string>(["security", "availability", "page", "a11y", "integrity", "monitoring"]);
+const SURFACES = new Set<string>(["web", "app", "desktop", "all"]);
 
 /**
  * 依鍵建索引，重複鍵一律以第一筆為準。
@@ -134,7 +140,19 @@ export function isEscalation(change: FindingChange): boolean {
   return severityRank(change.after.severity) < severityRank(change.before.severity);
 }
 
-/** 給報告抬頭用的計數。`changed` 只含嚴重度不同的筆數，故非惡化即減輕。 */
+/**
+ * 這筆變動是減輕嗎？
+ *
+ * 看起來只是 `isEscalation` 的反面，但兩者之間還有第三種答案：嚴重度沒變。
+ * `diffFindings` 不會產出那種 `changed`，可是 `ReportDiff` 是公開型別，
+ * 手工組出來的、或從 report.json 反序列化回來的 diff 都可能塞進同嚴重度的項目。
+ * 用「不是惡化就是減輕」去推，報告上會多出一件根本沒發生的好消息。
+ */
+export function isImprovement(change: FindingChange): boolean {
+  return severityRank(change.after.severity) > severityRank(change.before.severity);
+}
+
+/** 給報告抬頭用的計數。惡化與減輕各自判斷，理由見 `isImprovement`。 */
 export function summarizeDiff(diff: FindingDiff): {
   added: number;
   fixed: number;
@@ -142,13 +160,12 @@ export function summarizeDiff(diff: FindingDiff): {
   escalated: number;
   improved: number;
 } {
-  const escalated = diff.changed.filter(isEscalation).length;
   return {
     added: diff.added.length,
     fixed: diff.fixed.length,
     unchanged: diff.unchanged.length,
-    escalated,
-    improved: diff.changed.length - escalated,
+    escalated: diff.changed.filter(isEscalation).length,
+    improved: diff.changed.filter(isImprovement).length,
   };
 }
 
@@ -175,16 +192,30 @@ type Collected = { items: unknown[] } | { error: string };
  * 接受三種形狀：完整的 RunReport（`results[].findings[]`）、只有 `findings` 陣列的精簡格式，
  * 以及裸的發現陣列（手工整理的基準常長這樣）。認不出來就明講認不出來——
  * 把不認識的檔案當成空基準，等於宣告「上次全綠」，會讓所有存量問題被報成新增。
+ *
+ * 報告裡的 `suppressed` 刻意不讀。抑制是在比對之前發生的（見 `annotate.ts`），兩次執行
+ * 比的都是「讀者實際會看到的那份清單」；把上次被蓋住的發現撈回來當基準，會讓一筆從未
+ * 出現在報告上的問題被算成「已修復」。
  */
 function collectFindings(raw: object): Collected {
   if (Array.isArray(raw)) return { items: raw };
 
   const record = raw as Record<string, unknown>;
-  if (Array.isArray(record.findings)) return { items: record.findings };
+  const hasFindings = Array.isArray(record.findings);
+  const hasResults = Array.isArray(record.results);
 
-  if (Array.isArray(record.results)) {
+  // 真正的 RunReport 只有 results，精簡格式只有 findings；兩個都在就是一份被人改過的檔案，
+  // 而且無從得知哪一邊才是完整的那一份。挑一邊的代價都不對稱地大：少讀到的基準會讓存量問題
+  // 整片變成「新增」，多讀到的則會讓真正的新增被當成「持續」。所以這裡不猜，直接說看不懂。
+  if (hasFindings && hasResults) {
+    return { error: "同時有頂層 findings 與 results，看不出哪一份才是這次要比的基準" };
+  }
+
+  if (hasFindings) return { items: record.findings as unknown[] };
+
+  if (hasResults) {
     const items: unknown[] = [];
-    for (const [i, result] of record.results.entries()) {
+    for (const [i, result] of (record.results as unknown[]).entries()) {
       if (result === null || typeof result !== "object" || Array.isArray(result)) {
         return { error: `results[${i}] 不是檢查結果物件` };
       }
@@ -217,8 +248,10 @@ function normalizeFinding(entry: unknown): Finding | string {
   if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return "不是物件";
   const record = entry as Record<string, unknown>;
 
-  const id = record.id;
-  if (typeof id !== "string" || id.trim() === "") return "缺少 id（沒有穩定鍵就無從比對）";
+  // id 去掉前後空白再存：手工維護的精簡基準很容易多打一個空格，而鍵是逐字元比對的——
+  // 差一個空白，同一筆問題會在報告上同時出現在「新增」與「已修復」，比沒有基準還誤導人。
+  const id = typeof record.id === "string" ? record.id.trim() : "";
+  if (id === "") return "缺少 id（沒有穩定鍵就無從比對）";
 
   const severity = record.severity;
   if (typeof severity !== "string" || !SEVERITIES.has(severity)) {
@@ -230,25 +263,57 @@ function normalizeFinding(entry: unknown): Finding | string {
     return `\`${id}\` 的 where 不是字串（鍵會算錯）`;
   }
 
-  const text = (value: unknown, fallback: string): string => (typeof value === "string" ? value : fallback);
+  // 顯示欄位：空白字串視同沒填。標題留白的那一行在報告上只會是一個空格，
+  // 讀者連它是哪一筆都認不出來，還不如退回 id。
+  const text = (value: unknown, fallback: string): string =>
+    typeof value === "string" && value.trim() !== "" ? value : fallback;
+
+  /** 列舉欄位：認得的值才收。認不得就退回預設，不把陌生字串硬當成合法值。 */
+  const oneOf = <T extends string>(value: unknown, allowed: Set<string>, fallback: T): T =>
+    typeof value === "string" && allowed.has(value) ? (value as T) : fallback;
 
   const restored: Finding = {
     id,
     severity: severity as Severity,
-    // check／category／surface 只影響報告怎麼分節與顯示，不參與任何判定。
-    // 缺漏時補上不會誤導的預設值：check 退回 id 的第一段（id 的第一段本來就是檢查名），
-    // category 退回 security（比對區塊不依 category 分節，這個值只是型別上的佔位）。
+    // check／category／surface 只影響報告怎麼分節與顯示，不參與任何判定，
+    // 所以缺漏或認不得都不該讓整份基準作廢——但也不能原樣收下：一個不在列舉裡的
+    // category 會被型別當成合法分類，最後在報告上印出一個沒人看得懂的詞。
+    // 退回不會誤導的預設值：check 退回 id 的第一段（id 的第一段本來就是檢查名），
+    // category 退回 security、surface 退回 all（比對區塊不依這兩者分節，只是型別上的佔位）。
     check: text(record.check, id.split(".")[0] ?? id),
-    category: typeof record.category === "string" ? (record.category as Category) : "security",
-    surface: typeof record.surface === "string" ? (record.surface as SurfaceId | "all") : "all",
+    category: oneOf<Category>(record.category, CATEGORIES, "security"),
+    surface: oneOf<SurfaceId | "all">(record.surface, SURFACES, "all"),
     title: text(record.title, id),
     detail: text(record.detail, ""),
   };
-  if (typeof where === "string") restored.where = where;
+  // where 同樣去空白：它與 id 一起組成鍵，理由見上。去完是空的就當作沒有 where
+  // （`findingKey` 對 undefined 與空字串本來就算出同一把鍵，這裡只是讓兩者一致）。
+  if (typeof where === "string" && where.trim() !== "") restored.where = where.trim();
   if (typeof record.evidence === "string") restored.evidence = record.evidence;
   if (typeof record.remediation === "string") restored.remediation = record.remediation;
 
   return restored;
+}
+
+/**
+ * 這份完整報告的那一輪，到底有沒有真的量到東西？
+ *
+ * `summary.completed === 0` 是 runner 的既有語意：一項檢查都沒跑完（連不到站、缺瀏覽器、
+ * 全被過濾掉），`exitCodeFor` 對這種情形回的是 3 而不是 0，正因為那個綠燈的意思是
+ * 「我們什麼都沒驗」。同一份報告拿來當基準也一樣：它的空 findings 代表「沒測」，不代表
+ * 「上次全綠」。若照收，這次每一筆存量問題都會變成「新增」，`--fail-on-new` 隨即整片變紅，
+ * 而看報告的人會以為是今天改壞了。
+ *
+ * 只在看得出是完整報告（有 `results`）且 summary 明確寫著 completed 時才判斷；
+ * 精簡格式與裸陣列沒有這個欄位，那是人自己整理的基準，本來就不該用這條規則去質疑它。
+ */
+function untrustedRun(record: Record<string, unknown>): string | null {
+  if (!Array.isArray(record.results)) return null;
+  const summary = record.summary;
+  if (summary === null || typeof summary !== "object" || Array.isArray(summary)) return null;
+  const completed = (summary as Record<string, unknown>).completed;
+  if (typeof completed !== "number" || completed > 0) return null;
+  return "基準檔那一輪一項檢查都沒跑完（summary.completed 為 0），它記錄的是「什麼都沒驗」而不是「上次全綠」";
 }
 
 /**
@@ -261,8 +326,19 @@ function normalizeFinding(entry: unknown): Finding | string {
  *
  * 空基準（`findings: []`）與沒有基準是兩件事：前者代表上次確實全綠，這次的每一筆都是新增；
  * 後者是 `snapshot: null`，代表根本無從比較。這個區別必須留給呼叫端，不能在這裡壓平。
+ *
+ * 有一種壞基準這裡擋不了，用的人要自己知道：上一輪帶了 `--only`／`--skip` 而只驗了一部分。
+ * 那份報告的空白是「沒驗到」，但它的 `summary.completed` 是正常的，從結構上看不出差別，
+ * 於是這次多驗到的項目會全數被算成「新增」。基準要用整輪未過濾的報告——
+ * 報告層會把 `filter` 印在最上方，正是為了讓人在拿它當基準之前先看到這件事。
  */
 export function parseBaseline(json: string): { snapshot: BaselineSnapshot | null; error: string | null } {
+  // 空檔案是實務上最常見的一種壞基準（上一輪還沒寫完報告就掛了、CI 快取還原出 0 位元組）。
+  // 交給 JSON.parse 只會得到「Unexpected end of JSON input」，維運者看了不知道要修什麼。
+  if (json.trim() === "") {
+    return { snapshot: null, error: "基準檔是空的——上一輪多半沒有成功寫出報告，這不是「沒有發現」" };
+  }
+
   let raw: unknown;
   try {
     raw = JSON.parse(json);
@@ -273,6 +349,11 @@ export function parseBaseline(json: string): { snapshot: BaselineSnapshot | null
   if (raw === null || typeof raw !== "object") {
     return { snapshot: null, error: "基準檔的最外層不是物件或陣列，看不出是報告" };
   }
+
+  const record = Array.isArray(raw) ? {} : (raw as Record<string, unknown>);
+
+  const untrusted = untrustedRun(record);
+  if (untrusted !== null) return { snapshot: null, error: untrusted };
 
   const collected = collectFindings(raw);
   if ("error" in collected) {
@@ -288,7 +369,6 @@ export function parseBaseline(json: string): { snapshot: BaselineSnapshot | null
     findings.push(restored);
   }
 
-  const record = Array.isArray(raw) ? {} : (raw as Record<string, unknown>);
   return {
     snapshot: {
       findings,

@@ -93,7 +93,31 @@ export function analyzeDbTraffic(samples: ReadySample[], surface: Surface): { fi
         where: join(surface.origin, "/api/ready"),
       }),
     );
-  } else if (stats.avgLatencyMs !== null && stats.avgLatencyMs > SLOW_ROUNDTRIP_MS) {
+  } else if (stats.timeouts > 0) {
+    // 間歇逾時：有些取樣成功、有些連不上。
+    //
+    // 這正是連線池耗盡最典型的症狀（也是這個模組檔頭宣稱要抓的東西），但舊版只判「全數逾時」，
+    // 於是 3 次取樣有 2 次連不上時，報告是「檢查完成、零發現」——最糟的那種輸出。
+    // 間歇比全數更難查，因為健康檢查與人工重試常常剛好落在成功的那幾次。
+    findings.push(
+      finding({
+        ...base,
+        surface: surface.id,
+        id: "db.ready-intermittent",
+        severity: "high",
+        title: `${surface.label}：就緒端點間歇逾時（${stats.timeouts}/${stats.samples} 次）`,
+        detail:
+          "同一輪取樣裡有些成功、有些連不上。就緒檢查會實打資料庫，這種時好時壞通常代表連線池在尖峰被占滿——" +
+          "使用者遇到的是「有時候好好的，有時候轉圈很久然後失敗」，而人工重試常常剛好落在成功的那幾次，因此極難查。",
+        remediation: "檢查資料庫連線池上限與長交易；把就緒端點的逾時與重試設定拉出來看，確認不是探測本身太緊。",
+        evidence: `timeouts=${stats.timeouts}/${stats.samples} avg=${stats.avgLatencyMs ?? "?"}ms max=${stats.maxLatencyMs ?? "?"}ms`,
+        where: join(surface.origin, "/api/ready"),
+      }),
+    );
+  }
+
+  // 延遲判定與逾時判定並存：間歇逾時的那幾次成功樣本也可能同時偏慢，兩件事都值得說。
+  if (stats.reachable > 0 && stats.avgLatencyMs !== null && stats.avgLatencyMs > SLOW_ROUNDTRIP_MS) {
     findings.push(
       finding({
         ...base,

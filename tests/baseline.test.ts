@@ -4,6 +4,7 @@ import {
   findingKey,
   hasNewFindings,
   isEscalation,
+  isImprovement,
   parseBaseline,
   summarizeDiff,
 } from "../src/core/baseline.js";
@@ -121,6 +122,14 @@ describe("diffFindings", () => {
   it("兩次都沒有發現時四個欄位都是空的", () => {
     expect(diffFindings([], [])).toEqual({ added: [], fixed: [], unchanged: [], changed: [] });
   });
+
+  it("不改動傳進來的陣列——呼叫端手上的那份報告不該因為比對而變樣", () => {
+    const previous = [HSTS, NOSNIFF];
+    const current = [NOSNIFF];
+    diffFindings(previous, current);
+    expect(ids(previous)).toEqual(["headers.hsts.missing", "headers.nosniff"]);
+    expect(ids(current)).toEqual(["headers.nosniff"]);
+  });
 });
 
 describe("summarizeDiff", () => {
@@ -143,6 +152,27 @@ describe("summarizeDiff", () => {
       unchanged: 1,
       escalated: 1,
       improved: 1,
+    });
+  });
+
+  it("沒有任何變化時五項都是 0", () => {
+    expect(summarizeDiff({ added: [], fixed: [], unchanged: [], changed: [] })).toEqual({
+      added: 0,
+      fixed: 0,
+      unchanged: 0,
+      escalated: 0,
+      improved: 0,
+    });
+  });
+
+  it("嚴重度沒變的 changed 既不算惡化也不算減輕——報告不該多出一件根本沒發生的好消息", () => {
+    // diffFindings 不會產出這種項目，但 ReportDiff 是公開型別，手工組或反序列化回來的都可能有。
+    const flat = { key: findingKey(HSTS), before: HSTS, after: mk({ ...HSTS, evidence: "本次觀測" }) };
+    expect(isEscalation(flat)).toBe(false);
+    expect(isImprovement(flat)).toBe(false);
+    expect(summarizeDiff({ added: [], fixed: [], unchanged: [], changed: [flat] })).toMatchObject({
+      escalated: 0,
+      improved: 0,
     });
   });
 });
@@ -236,6 +266,88 @@ describe("parseBaseline", () => {
     const { snapshot } = parseBaseline(JSON.stringify({ target: "https://staging.aios.test", findings: [HSTS] }));
     expect(snapshot?.target).toBe("https://staging.aios.test");
     expect(diffFindings(snapshot?.findings ?? [], [HSTS]).unchanged).toHaveLength(1);
+  });
+
+  it("空檔案有自己的說法，而不是丟一句 JSON 解析錯誤給維運者", () => {
+    // 上一輪還沒寫完報告就掛掉、CI 快取還原出 0 位元組——這是實務上最常見的壞基準。
+    const { snapshot, error } = parseBaseline("   ");
+    expect(snapshot).toBeNull();
+    expect(error).toMatch(/基準檔是空的/);
+  });
+
+  it("上一輪一項檢查都沒跑完的報告不可當基準——那是「什麼都沒驗」，不是「上次全綠」", () => {
+    const json = JSON.stringify({
+      target: "https://aios.test",
+      results: [{ check: "headers", completed: false, skippedReason: "連不到站" }],
+      summary: { total: 1, completed: 0 },
+    });
+    const { snapshot, error } = parseBaseline(json);
+    expect(snapshot).toBeNull();
+    expect(error).toMatch(/一項檢查都沒跑完/);
+  });
+
+  it("有檢查真的跑完、只是零發現的報告仍是可信的空基準", () => {
+    const json = JSON.stringify({
+      target: "https://aios.test",
+      results: [{ check: "headers", completed: true, findings: [] }],
+      summary: { total: 1, completed: 1 },
+    });
+    const { snapshot, error } = parseBaseline(json);
+    expect(error).toBeNull();
+    expect(snapshot?.findings).toEqual([]);
+  });
+
+  it("同時有頂層 findings 與 results 時回 error，不靜默挑一邊", () => {
+    // 挑錯邊的代價不對稱地大：少讀到基準會讓存量問題整片變成「新增」而淹沒 CI。
+    const { snapshot, error } = parseBaseline(JSON.stringify({ findings: [], results: [{ findings: [HSTS] }] }));
+    expect(snapshot).toBeNull();
+    expect(error).toMatch(/看不出哪一份/);
+  });
+
+  it("報告裡被抑制的發現不進基準——比對比的是讀者實際看得到的那份清單", () => {
+    const json = JSON.stringify({
+      target: "https://aios.test",
+      summary: { total: 1, completed: 1 },
+      results: [{ check: "headers", findings: [NOSNIFF] }],
+      suppressed: [{ finding: HSTS, reason: "已知取捨", expires: null, owner: null }],
+    });
+    const { snapshot, error } = parseBaseline(json);
+    expect(error).toBeNull();
+    expect(ids(snapshot?.findings ?? [])).toEqual(["headers.nosniff"]);
+    // 抑制規則被拿掉、那筆重新出現在報告上時，它對讀者而言就是新的。
+    expect(ids(diffFindings(snapshot?.findings ?? [], [NOSNIFF, HSTS]).added)).toEqual(["headers.hsts.missing"]);
+  });
+
+  it("results 裡形狀不對的一筆會讓整份基準判定失敗，而不是被跳過", () => {
+    expect(parseBaseline(JSON.stringify({ results: [null] })).error).toMatch(/results\[0\]/);
+    expect(parseBaseline(JSON.stringify({ results: [{ check: "a", findings: 3 }] })).error).toMatch(/不是陣列/);
+  });
+
+  it("where 不是字串時回 error——鍵會算錯，整份比對就不可信了", () => {
+    const { snapshot, error } = parseBaseline(JSON.stringify([{ id: "headers.nosniff", severity: "medium", where: 5 }]));
+    expect(snapshot).toBeNull();
+    expect(error).toMatch(/where/);
+  });
+
+  it("認不得的 category／surface 退回預設，空白標題退回 id，不把陌生字串當成合法值", () => {
+    const { snapshot, error } = parseBaseline(
+      JSON.stringify([{ id: "headers.nosniff", severity: "medium", category: "banana", surface: "ios", title: "  " }]),
+    );
+    expect(error).toBeNull();
+    const restored = snapshot?.findings[0];
+    expect(restored?.category).toBe("security");
+    expect(restored?.surface).toBe("all");
+    expect(restored?.title).toBe("headers.nosniff");
+  });
+
+  it("手工基準裡多打的空白不會讓同一筆問題變成「又新增又修好」", () => {
+    const { snapshot } = parseBaseline(
+      JSON.stringify([{ id: " headers.nosniff ", severity: "medium", where: " https://a.test/ " }]),
+    );
+    const diff = diffFindings(snapshot?.findings ?? [], [NOSNIFF]);
+    expect(diff.unchanged).toHaveLength(1);
+    expect(diff.added).toEqual([]);
+    expect(diff.fixed).toEqual([]);
   });
 });
 

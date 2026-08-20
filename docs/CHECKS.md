@@ -321,10 +321,13 @@ axe-core WCAG 2.0/2.1 A+AA。impact 對應：`critical`→high、`serious`→med
 | `analytics.posthog.personal-key-leak` | critical | 前端疑似寫死 `phx_`／`phs_` 個人金鑰（公開的 `phc_` 專案金鑰不報） |
 | `analytics.posthog.no-exception-capture` | medium | 未開 `capture_unhandled_errors`，前端例外不進監測 |
 | `analytics.posthog.no-console-capture` | low | 未擷取 console 錯誤（ai_os 現況取捨） |
-| `analytics.posthog.not-loaded` | high | 正式站進入點找不到 PostHog——金鑰漏設時事件會靜默全掉 |
-| `analytics.posthog.csp-blocked` | high | 有載 PostHog 但 CSP `script-src` 未放行其來源，請求會被瀏覽器擋掉 |
+| `analytics.posthog.not-loaded` | high | 正式站進入點找不到 PostHog——金鑰漏設時事件會靜默全掉。**bundle 沒讀完整時不報**：entry chunk 動輒數 MB，沒讀完就不能說裡面沒有 |
+| `analytics.posthog.csp-blocked` | high | 有載 PostHog 但 CSP `script-src` 未放行其來源，請求會被瀏覽器擋掉。CSP **沒有可據以判定的來源清單**（沒設 CSP，或只有 `frame-ancestors` 這種單指令政策）時不報——那與「明確不含 PostHog」是兩件事 |
 | `analytics.posthog.no-recent-events` | high | （需 API 金鑰）觀測窗內 0 事件，分析疑似靜默失效 |
 | `analytics.posthog.exceptions-observed` | medium | （需 API 金鑰）觀測到前端例外事件 |
+
+站台連不上時整項回 `completed: false`——回「完成且零發現」等於宣稱「正式站有載入 PostHog、CSP 也放行了」，
+而那兩件事一項都沒測。
 
 深度段需 `POSTHOG_API_KEY`／`POSTHOG_PROJECT_ID`／`POSTHOG_HOST`；未提供時記錄 `insightSkipped`，不假裝有拉到資料。
 
@@ -334,7 +337,7 @@ axe-core WCAG 2.0/2.1 A+AA。impact 對應：`critical`→high、`serious`→med
 | --- | --- | --- |
 | `zeabur.edge-5xx` | high | 反向代理回 502/503/504 且非應用頁面（後端當掉／冷啟動） |
 | `zeabur.gateway-intercept` | medium | 回應被中介層攔截，本輪其實沒觸及站台 |
-| `zeabur.ephemeral-storage` | high | 就緒 storage 分項顯示素材存非持久磁碟，重新部署即遺失 |
+| `zeabur.ephemeral-storage` | high | **storage 分項回報未通過**且 note 指向非持久磁碟。前提是分項狀態，不是拿 note 的文字去猜——純子字串比對讀不出否定語意，「Volume 已掛載，不會遺失」會同時命中兩組樣式 |
 | `zeabur.deploy-failed` | high | （需 API token）最近一次部署狀態為 FAILED/ERROR |
 
 應用自己回的 5xx（帶 SPA 外殼或應用 JSON）歸類為 `app-error`，交由 health/page-test 處理，不在此重報。
@@ -348,6 +351,7 @@ axe-core WCAG 2.0/2.1 A+AA。impact 對應：`critical`→high、`serious`→med
 | --- | --- | --- |
 | `db.unreachable` | critical | db 分項失敗，讀寫進出中斷 |
 | `db.ready-timeout` | high | 取樣全數逾時，連線池疑似耗盡 |
+| `db.ready-intermittent` | high | 取樣**部分**逾時。這才是連線池耗盡最典型的樣子，也最難查——人工重試常常剛好落在成功的那幾次 |
 | `db.slow-roundtrip` | medium | 就緒平均延遲 > 1500ms（DB 往返偏慢） |
 | `db.url-in-client` | critical | 連線字串疑似出現在前端 |
 | `db.public-studio` | high | 疑似有公開的資料庫管理介面 |
@@ -355,8 +359,11 @@ axe-core WCAG 2.0/2.1 A+AA。impact 對應：`critical`→high、`serious`→med
 ## device（裝置紀錄）
 
 把每一端的裝置人格（UA、視窗、行動、觸控、殼層標頭）與實測回應原樣記入 `facts.deviceLedger`。
+帳本涵蓋**每一個受測端**，包含連不上的（`observed.status` 為 0 並附原因）——這個檢查唯一的產出
+就是「我們當時是以什麼裝置在測」，帳本悄悄少掉兩端等於在那個問題上說謊。
 
 | id | 等級 | 判定 |
 | --- | --- | --- |
 | `device.persona-mismatch.<surface>` | low | 該端裝置人格內部不一致（標為行動卻是桌面 UA／寬視窗） |
 | `device.blocked.<surface>` | high | 只有此裝置被伺服器回 403/451 而其他端正常（按裝置歧視／WAF 誤擋） |
+| `device.unobserved.<surface>` | low | 這一端連不上，帳本裡有它的人格但沒有實測回應——跨端比對缺了它 |

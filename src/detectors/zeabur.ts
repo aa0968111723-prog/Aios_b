@@ -51,6 +51,14 @@ export interface ZeaburAssessment {
   root: ResponseSignal;
   /** /api/ready 的 storage 分項說明（若取得）。 */
   storageNote?: string | null;
+  /**
+   * 就緒回應的 storage 分項是否通過。
+   *
+   * 判定必須以這個為前提，note 只當補充。note 是自然語言，純子字串比對讀不出否定語意——
+   * 「Volume 已掛載，重新部署不會遺失素材」會同時命中「Volume」與「遺失」，
+   * 於是把設定講清楚的健康站台報成 high。
+   */
+  storageOk?: boolean | null;
 }
 
 export function analyzeZeabur(input: ZeaburAssessment, surface: Surface): Finding[] {
@@ -89,9 +97,15 @@ export function analyzeZeabur(input: ZeaburAssessment, surface: Surface): Findin
     );
   }
 
-  // 素材儲存在非持久磁碟：ai_os 啟動時會擲錯，就緒分項的 note 也會帶線索。
+  // 素材儲存在非持久磁碟。
+  //
+  // 判定的前提是 **storage 分項確實回報未通過**，不是拿 note 的文字去猜。
+  // 舊版只對 note 做關鍵字比對，而「Volume 已掛載，重新部署不會遺失素材」這種
+  // 把設定講清楚的健康回應，同時命中「Volume」與「遺失」兩組樣式——結果是
+  // 寫得越清楚的站台越容易被誤報成 high。純子字串比對讀不出否定語意，就不該拿來當判準。
   const note = input.storageNote ?? "";
-  if (/非持久|本地磁碟|重新部署會遺失|Volume|ASSET_DIR/.test(note) && /(非持久|本地|遺失)/.test(note)) {
+  const storageFailed = input.storageOk === false;
+  if (storageFailed && /非持久|本地磁碟|臨時|ephemeral|ASSET_DIR|Volume/i.test(note)) {
     out.push(
       finding({
         ...base,
@@ -170,14 +184,17 @@ export async function checkZeabur(surface: Surface, timeoutMs: number): Promise<
 
   // 取就緒的 storage 分項說明（供非持久磁碟判定）。
   let storageNote: string | null = null;
+  let storageOk: boolean | null = null;
   const ready = await tryProbe(join(surface.origin, "/api/ready"), { surface, timeoutMs, followRedirects: 2 });
   if (!isProbeFailure(ready)) {
-    const body = parseJson<{ components?: Record<string, { note?: string }> }>(ready.body);
+    const body = parseJson<{ components?: Record<string, { note?: string; ok?: boolean }> }>(ready.body);
     storageNote = body?.components?.storage?.note ?? null;
+    storageOk = typeof body?.components?.storage?.ok === "boolean" ? body.components.storage.ok : null;
     facts.storageNote = storageNote;
+    facts.storageOk = storageOk;
   }
 
-  findings.push(...analyzeZeabur({ root: signal, storageNote }, surface));
+  findings.push(...analyzeZeabur({ root: signal, storageNote, storageOk }, surface));
 
   // 深度：Zeabur API（需 token + service id）。
   const token = process.env.ZEABUR_API_TOKEN;
