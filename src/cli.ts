@@ -494,7 +494,9 @@ async function main(): Promise<void> {
 
   const planned = applyFilter(checks, filter);
   const filterNote = describeFilter(filter);
-  if (filterNote) note(`檢查範圍：${filterNote}`);
+  // 範圍縮小的告示要在開跑前就講，而且要把「未執行不等於通過」講出來——
+  // describeFilter 只負責描述篩了什麼，這句提醒是呼叫端的責任。
+  if (filterNote) note(`檢查範圍：${filterNote}——未執行的項目沒有結論，不代表通過。`);
 
   if (!jsonOnly) {
     process.stdout.write(`\n開始檢測 ${config.target}（${config.surfaces.map((s) => s.id).join("、")}）——共 ${planned.length} 項\n`);

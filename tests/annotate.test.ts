@@ -193,6 +193,43 @@ describe("annotateReport — 跨次比對", () => {
   });
 });
 
+/**
+ * 後製只能改變呈現，不能改變事實——這條規則有一個很容易被忽略的角落：
+ * 後製自己產生的 meta 結果，絕不能被算成「跑過的檢查」。
+ */
+describe("annotateReport — meta 結果不算跑過的檢查", () => {
+  const rules = parseSuppressions(JSON.stringify([{ id: "never.matches", reason: "留著以防復發", expires: "2026-12-31" }]));
+
+  it("什麼都沒跑到的那一輪，不會因為多了抑制提醒而變成跑過了", () => {
+    const skippedOnly: RunReport = {
+      ...makeReport([]),
+      results: [
+        {
+          check: "transport",
+          category: "security",
+          surface: "web",
+          completed: false,
+          skippedReason: "連不到站台。",
+          durationMs: 0,
+          findings: [],
+        },
+      ],
+    };
+    const report = annotateReport(skippedOnly, { suppressions: rules, now: NOW });
+
+    // 抑制提醒確實產生了（死規則要被點名）……
+    expect(ids(report).some((id) => id.startsWith("suppress.stale"))).toBe(true);
+    // ……但它不能讓 completed 從 0 變成 1，否則結束碼會從 3（什麼都沒驗）變成 0（綠燈）。
+    expect(report.summary.completed).toBe(0);
+    expect(report.summary.total).toBe(1);
+  });
+
+  it("meta 結果仍然留在 results 裡，讀者看得到", () => {
+    const report = annotateReport(makeReport([makeFinding("headers.nosniff", "medium")]), { suppressions: rules, now: NOW });
+    expect(report.results.some((r) => r.check === "suppress" && r.meta === true)).toBe(true);
+  });
+});
+
 describe("annotateReport — 涵蓋範圍", () => {
   it("有過濾時寫進 report.filter", () => {
     const report = annotateReport(makeReport([]), { filter: { only: ["csp"], skip: [] } });

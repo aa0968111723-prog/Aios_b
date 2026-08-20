@@ -61,6 +61,16 @@ export interface CheckResult {
   facts?: Record<string, unknown>;
   /** 檢查自己爆掉（不是目標有問題，是檢測器有問題）——必須跟「發現問題」分開看。 */
   error?: string;
+  /**
+   * 這筆結果是**後製產生的**（抑制清單的提醒、基準檔讀取錯誤），不是真的跑了一項檢查。
+   *
+   * summary 的 completed／skipped／errored 一律排除它。否則會出現這種結局：
+   * 站台完全連不到、每一項檢查都被標記跳過（此時結束碼應該是 3「什麼都沒實際執行」），
+   * 但只要那一輪帶了 `--suppress`（CI 上是常態），抑制清單的「這條規則沒命中」提醒就會
+   * 生出一筆 completed 的結果，於是 completed 從 0 變成 1，exit 3 變成 exit 0——
+   * 一輪什麼都沒驗到的執行，在 CI 上顯示綠燈。
+   */
+  meta?: boolean;
 }
 
 export interface Surface {

@@ -76,17 +76,36 @@ async function readBody(res: Response, maxBytes: number): Promise<{ body: string
   const chunks: Uint8Array[] = [];
   let size = 0;
   let truncated = false;
+  let finished = false;
   try {
-    while (size < maxBytes) {
+    while (!finished && size < maxBytes) {
       const { done, value } = await reader.read();
-      if (done) break;
+      finished = done;
+      if (done || !value) continue;
       chunks.push(value);
       size += value.byteLength;
     }
-    // 還沒讀完就達到上限：標記截斷並放棄剩餘串流，別讓大檔拖住整輪掃描。
-    if (size >= maxBytes) {
-      truncated = true;
-      await reader.cancel().catch(() => {});
+
+    // 達到上限時**再讀一次**，看串流是不是其實已經結束了。
+    //
+    // 判準必須是「串流還沒結束」，不能是「size 達到上限」——內容剛好等於上限（或一整包
+    // 在單一 chunk 送達）時，舊版會把一份一個 byte 都沒少的回應標成截斷。代價很具體：
+    // supply-chain 會據此回「首頁 HTML 超過讀取上限」並放棄整份子資源盤點，
+    // disclosure 則會宣告 source map 未驗證。一份完整的回應，換來一項沒做的檢查。
+    //
+    // 多讀的這一次最多只多拿一個 chunk，而且受同一個逾時保護。
+    if (!finished) {
+      const { done, value } = await reader.read();
+      if (done) {
+        finished = true;
+      } else {
+        truncated = true;
+        if (value) {
+          chunks.push(value);
+          size += value.byteLength;
+        }
+        await reader.cancel().catch(() => {});
+      }
     }
   } catch {
     // 讀到一半斷線：已讀到的部分仍有分析價值（例如 CSP meta 標籤就在 head）。

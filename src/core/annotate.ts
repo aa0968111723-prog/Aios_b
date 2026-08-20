@@ -31,9 +31,14 @@ export interface AnnotateInput {
 
 const META: Pick<CheckResult, "category" | "surface"> = { category: "integrity", surface: "all" };
 
-/** 把一組 meta 發現包成一筆已完成的檢查結果，讓它們走一般的報告管線。 */
+/**
+ * 把一組 meta 發現包成一筆結果，讓它們走一般的報告管線。
+ *
+ * `meta: true` 不是裝飾：summary 的 completed／skipped／errored 會排除它。
+ * 後製不可以把任何東西變成「跑過的檢查」——那會讓「什麼都沒驗」的那一輪從 exit 3 變成 exit 0。
+ */
 function metaResult(check: string, findings: Finding[]): CheckResult {
-  return { check, ...META, completed: true, durationMs: 0, findings };
+  return { check, ...META, completed: true, durationMs: 0, findings, meta: true };
 }
 
 /**
@@ -75,14 +80,21 @@ function baselineErrorFinding(error: string): Finding {
   });
 }
 
-/** 重算 summary。抑制會改變發現數，比對與過濾不會——但三者都可能新增 meta 檢查結果。 */
+/**
+ * 重算 summary。
+ *
+ * 發現數要含 meta 結果（抑制提醒與基準錯誤都是讀者該看到的發現），
+ * 但**檢查計數一律排除 meta**——那些不是跑過的檢查，把它們算進 completed
+ * 會直接破壞 exitCodeFor 的「什麼都沒實際執行回 3」那條防線。
+ */
 function recomputeSummary(results: CheckResult[], suppressedCount: number): RunReport["summary"] {
   const all = results.flatMap((r) => r.findings);
+  const real = results.filter((r) => !r.meta);
   return {
-    total: results.length,
-    completed: results.filter((r) => r.completed).length,
-    skipped: results.filter((r) => !r.completed && r.skippedReason).length,
-    errored: results.filter((r) => r.error).length,
+    total: real.length,
+    completed: real.filter((r) => r.completed).length,
+    skipped: real.filter((r) => !r.completed && r.skippedReason).length,
+    errored: real.filter((r) => r.error).length,
     suppressed: suppressedCount,
     findings: countBySeverity(all),
     worst: worstSeverity(all),

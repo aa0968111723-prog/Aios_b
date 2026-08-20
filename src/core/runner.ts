@@ -57,7 +57,15 @@ export async function runChecks(
 
   for (const item of planned) {
     hooks.onCheckStart?.(item.name, String(item.surface));
-    const result = await safely(item.name, { category: item.category, surface: item.surface }, item.run);
+    const raw = await safely(item.name, { category: item.category, surface: item.surface }, item.run);
+    // `perOrigin` 把「三端共用同一個 origin」的檢查標成 all，但偵測器只知道自己拿到的
+    // 那個代表 surface，會蓋上單一端的章。不在這裡對齊的話，那個判定只有在檢查爆掉
+    // （走 safely 的例外路徑）時才會進報告——成功時報告仍宣稱「這是 web 端的發現」，
+    // 而它其實同時適用於三端。
+    const result =
+      item.surface === "all" && raw.surface !== "all"
+        ? { ...raw, surface: "all" as const, findings: raw.findings.map((f) => ({ ...f, surface: "all" as const })) }
+        : raw;
     results.push(result);
     hooks.onCheckDone?.(result);
   }
@@ -147,12 +155,20 @@ export function perOrigin(
 export function exitCodeFor(report: RunReport, failOn: Severity, options: { onlyNew?: boolean } = {}): number {
   const { worst, completed, errored } = report.summary;
   if (completed === 0) return 3;
-  if (errored > 0 && worst === null) return 2;
 
   // 判準委派給 baseline.ts，不在這裡另寫一份「什麼算惡化」。
   // 兩份門檻邏輯遲早會走偏，而走偏的那天不會有人發現——只會發現某天 CI 突然不擋了。
-  if (options.onlyNew && report.diff) return hasNewFindings(report.diff, failOn) ? 1 : 0;
+  const failing =
+    options.onlyNew && report.diff
+      ? hasNewFindings(report.diff, failOn)
+      : worst !== null && severityRank(worst) <= severityRank(failOn);
 
-  if (!worst) return 0;
-  return severityRank(worst) <= severityRank(failOn) ? 1 : 0;
+  if (failing) return 1;
+
+  // errored 的判定必須獨立於 worst，而且排在門檻判定**之後**。
+  //
+  // 舊版寫成 `errored > 0 && worst === null`，於是任何一筆與爆掉的檢查毫無關係的
+  // low／info 都能把「檢測器自己壞了」整個藏起來。而帶 `--suppress` 時
+  // suppress.no-expiry 這類 info 級提醒會讓 worst 永遠不是 null——exit 2 從此再也不會出現。
+  return errored > 0 ? 2 : 0;
 }

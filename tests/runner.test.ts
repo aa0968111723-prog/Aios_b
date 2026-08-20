@@ -120,6 +120,18 @@ describe("exitCodeFor", () => {
     expect(exitCodeFor(report({ errored: 1 }), "high")).toBe(2);
   });
 
+  // 舊版寫成 `errored > 0 && worst === null`，於是任何一筆與爆掉的檢查毫無關係的
+  // low／info 都能把「檢測器自己壞了」整個藏起來。帶 --suppress 時
+  // suppress.no-expiry 這類 info 提醒會讓 worst 永遠不是 null——exit 2 從此再也不會出現。
+  it("檢查器出錯不會被一筆低於門檻的發現掩蓋", () => {
+    expect(exitCodeFor(report({ errored: 9, worst: "low" as Severity }), "high")).toBe(2);
+    expect(exitCodeFor(report({ errored: 1, worst: "info" as Severity }), "high")).toBe(2);
+  });
+
+  it("但達門檻的發現優先於檢查器錯誤——先讓人看到站台的問題", () => {
+    expect(exitCodeFor(report({ errored: 1, worst: "critical" as Severity }), "high")).toBe(1);
+  });
+
   it("什麼都沒實際跑到回 3——不能讓 CI 顯示綠燈", () => {
     expect(exitCodeFor(report({ completed: 0, skipped: 5, total: 5 }), "high")).toBe(3);
   });
@@ -218,5 +230,41 @@ describe("perOrigin", () => {
 
   it("沒有可連的端時回空陣列，不會憑空產生一項", () => {
     expect(perOrigin([], "tls", "security", () => task)).toEqual([]);
+  });
+
+  // perOrigin 把三端同源的檢查標成 all，但偵測器只知道自己拿到的那個代表 surface，
+  // 會蓋上單一端的章。不在 runChecks 對齊的話，那個判定只有在檢查爆掉時才進報告——
+  // 成功時報告仍宣稱「這是 web 端的發現」，而它其實同時適用於三端。
+  it("成功路徑也要吃到 all 的標記，findings 一起改", async () => {
+    const surfaces = buildSurfaces("https://example.test");
+    const planned = perOrigin(surfaces, "tls", "security", (s) => async () =>
+      result({
+        check: "tls",
+        surface: s.id,
+        findings: [
+          finding({
+            id: "tls.cert.expiring",
+            check: "tls",
+            category: "security",
+            severity: "high",
+            surface: s.id,
+            title: "t",
+            detail: "d",
+            remediation: "r",
+          }),
+        ],
+      }),
+    );
+
+    const run = await runChecks(config, planned);
+    expect(run.results[0]?.surface).toBe("all");
+    expect(run.results[0]?.findings[0]?.surface).toBe("all");
+  });
+
+  it("多 origin 時各自標自己的端，不會被誤改成 all", async () => {
+    const surfaces = buildSurfaces("https://example.test", { app: "https://app.example.test" });
+    const planned = perOrigin(surfaces, "tls", "security", (s) => async () => result({ check: "tls", surface: s.id }));
+    const run = await runChecks(config, planned);
+    expect(run.results.map((r) => r.surface)).toEqual(["all", "app"]);
   });
 });

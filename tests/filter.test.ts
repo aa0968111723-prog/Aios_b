@@ -88,6 +88,21 @@ describe("matchesFilter", () => {
   it("手寫的 filter 沒走過 parseFilter 也要判對——判定不該取決於呼叫路徑", () => {
     expect(matchesFilter({ name: "cors", category: "security" }, mk([" CORS "]))).toBe(true);
   });
+
+  it("只由空白組成的 only 等同沒給——保守解是全部照跑，不是靜默地把每一項都篩掉", () => {
+    // 照字面解讀成「有指定 only」的話，每一項都不命中而被剔除，產出一份零發現、
+    // 外觀完全正常的報告；那個 token 印出來又是一片空白，連警告都指不出是哪裡錯。
+    expect(keptNames(mk(["  ", ""]))).toEqual(names(CHECKS));
+  });
+
+  it("只由空白組成的 skip 不會誤剔除任何一項", () => {
+    expect(keptNames(mk([], ["   "]))).toEqual(names(CHECKS));
+  });
+
+  it("手寫 filter 與 parseFilter 對同一份輸入結論一致——涵蓋範圍不該因為走哪條路而改變", () => {
+    const raw = " CORS , ,cors ";
+    expect(keptNames(mk(raw.split(",")))).toEqual(keptNames(parseFilter(raw, undefined)));
+  });
 });
 
 describe("partitionChecks", () => {
@@ -118,6 +133,19 @@ describe("partitionChecks", () => {
     expect(kept).toEqual([]);
     expect(excluded).toHaveLength(CHECKS.length);
   });
+
+  it("FilterTarget 以外的欄位原樣保留——cli.ts 靠它把被篩掉的 PlannedCheck 取回來標成跳過", () => {
+    const planned = CHECKS.map((c) => ({ ...c, run: () => c.name }));
+    const { kept, excluded } = partitionChecks(planned, mk(["cors"]));
+    expect(kept[0]?.run()).toBe("cors");
+    expect(excluded.every((c) => typeof c.run === "function")).toBe(true);
+  });
+
+  it("不改動傳進來的陣列——呼叫端還要拿原清單去對總數", () => {
+    const input = [...CHECKS];
+    partitionChecks(input, mk(["security"], ["cors"]));
+    expect(input).toEqual(CHECKS);
+  });
 });
 
 describe("unknownTokens", () => {
@@ -145,6 +173,16 @@ describe("unknownTokens", () => {
   it("同一個錯字重複出現在 only 與 skip 只報一次", () => {
     expect(unknownTokens(mk(["Typo"], [" typo "]), CHECKS)).toEqual(["typo"]);
   });
+
+  it("空白 token 不會被報成一則看不見的警告，它本來也篩不掉任何檢查", () => {
+    const filter = mk(["  "], [""]);
+    expect(unknownTokens(filter, CHECKS)).toEqual([]);
+    expect(keptNames(filter)).toEqual(names(CHECKS));
+  });
+
+  it("known 清單為空時照樣把 token 全報出來——沒有東西可比不等於條件沒問題", () => {
+    expect(unknownTokens(parseFilter("cors", undefined), [])).toEqual(["cors"]);
+  });
 });
 
 describe("describeFilter", () => {
@@ -152,12 +190,25 @@ describe("describeFilter", () => {
     expect(describeFilter(mk())).toBe("");
   });
 
-  it("有過濾就要講清楚篩了什麼，並提醒沒跑到不等於通過", () => {
-    const line = describeFilter(parseFilter("security", "cors"));
-    expect(line).toContain("security");
-    expect(line).toContain("cors");
-    expect(line).toContain("不代表通過");
+  it("有過濾就要把篩了什麼講完整，only 與 skip 都不能漏", () => {
+    const line = describeFilter(parseFilter("security,health", "cors"));
+    for (const token of ["security", "health", "cors"]) expect(line).toContain(token);
+  });
+
+  it("摘要是可嵌進別人句子的片語：不自帶抬頭、不自帶句號、單行", () => {
+    // 呼叫端會把它包進自己的句子（cli.ts 有兩處），自帶抬頭會變成「檢查範圍：檢查過濾：…」的疊字，
+    // 自帶整句則讓跳過理由的句法崩掉——而那句話會原樣寫進每一個被過濾檢查的 skippedReason。
+    const line = describeFilter(parseFilter("health", "cors"));
+    expect(line).toBe("只執行 health；略過 cors");
+    expect(line).not.toMatch(/[。：]/);
     expect(line.split("\n")).toHaveLength(1);
+    expect(`依 ${line} 排除，本輪未執行——未執行不等於通過。`).toBe(
+      "依 只執行 health；略過 cors 排除，本輪未執行——未執行不等於通過。",
+    );
+  });
+
+  it("摘要用收斂後的 token——印出重複或空白的條件，讀者就無法用這行字回推涵蓋範圍", () => {
+    expect(describeFilter(mk([" CORS ", "cors", "  "]))).toBe("只執行 cors");
   });
 
   it("只有 only 或只有 skip 時，摘要不會提到另一半", () => {
@@ -169,6 +220,10 @@ describe("describeFilter", () => {
 describe("KNOWN_CATEGORIES", () => {
   it("涵蓋實際檢查用到的每一個分類——少一個就會讓合法的 --only 提示查不到", () => {
     for (const check of CHECKS) expect(KNOWN_CATEGORIES).toContain(check.category);
+  });
+
+  it("沒有重複項——重複會讓「可以填哪些分類」的提示看起來像壞掉了", () => {
+    expect(new Set(KNOWN_CATEGORIES).size).toBe(KNOWN_CATEGORIES.length);
   });
 
   it("每個分類名都能當成 only token 使用", () => {

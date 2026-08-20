@@ -42,21 +42,33 @@ export interface FilterTarget {
 const normalize = (value: string): string => value.trim().toLowerCase();
 
 /**
- * 逗號分隔字串 → token 陣列。
+ * 把一份 token 清單收斂成「實際會生效的樣子」：正規化、丟掉空 token、去重。
  *
- * 空 token 一律丟掉：`--only cors,` 的尾逗號會產生一個空字串，留著就是一個什麼都不命中的 token，
- * 讓報告變空卻找不出原因——而使用者只會覺得工具壞了。
+ * 這支刻意被**每一個讀 filter 的函式**共用，而不是只在 `parseFilter` 裡做一次。理由是空 token 會
+ * 製造這個模組最不能容忍的那種失敗：`{ only: ["  "] }` 若照字面解讀成「有指定 only」，每一項檢查
+ * 都不命中而被整批篩掉，產出一份零發現、外觀完全正常的報告；偏偏那個 token 印出來是一片空白，
+ * 連 `unknownTokens` 都沒有東西可以指著說「這個沒對應到」。沒有人會懷疑那份報告。
+ * 收斂之後，這種輸入等同「沒有指定」——保守解是全部照跑：寧可多跑幾項，也不要靜默地什麼都不跑。
+ *
+ * 順帶讓判定不再取決於呼叫端有沒有先走過 `parseFilter`：同一個字串走哪條路都得到同一個結論。
  */
-function tokenize(value: string | undefined): string[] {
-  if (!value) return [];
+function effective(tokens: string[]): string[] {
   const out: string[] = [];
-  for (const raw of value.split(",")) {
+  for (const raw of tokens) {
     const token = normalize(raw);
     if (token.length === 0) continue;
     if (!out.includes(token)) out.push(token);
   }
   return out;
 }
+
+/**
+ * 逗號分隔字串 → token 陣列。
+ *
+ * 尾逗號（`--only cors,`）會切出一個空字串，正是上面 `effective` 要擋掉的東西——
+ * 使用者不會覺得自己多打了一個逗號，只會覺得工具壞了。
+ */
+const tokenize = (value: string | undefined): string[] => effective(value ? value.split(",") : []);
 
 /**
  * 解析 CLI 給的兩個字串。
@@ -88,11 +100,14 @@ export function parseFilter(only: string | undefined, skip: string | undefined):
  */
 export function matchesFilter(target: FilterTarget, filter: CheckFilter): boolean {
   const identities = [normalize(target.name), normalize(target.category)];
-  const hits = (tokens: string[]): boolean => tokens.some((token) => identities.includes(normalize(token)));
+  const hits = (tokens: string[]): boolean => tokens.some((token) => identities.includes(token));
 
-  if (hits(filter.skip)) return false;
-  if (filter.only.length === 0) return true;
-  return hits(filter.only);
+  // 兩份清單都先收斂：只由空白組成的 only 會被當成「沒有指定」而留下全部，
+  // 而不是把每一項都篩掉再讓呼叫端拿著一份空報告去以為自己驗過了。
+  const only = effective(filter.only);
+  if (hits(effective(filter.skip))) return false;
+  if (only.length === 0) return true;
+  return hits(only);
 }
 
 /**
@@ -138,28 +153,38 @@ export function unknownTokens(filter: CheckFilter, known: FilterTarget[]): strin
     available.add(normalize(target.category));
   }
 
-  const out: string[] = [];
-  for (const token of [...filter.only, ...filter.skip]) {
-    const value = normalize(token);
-    if (value.length === 0 || available.has(value)) continue;
-    if (!out.includes(value)) out.push(value);
-  }
-  return out;
+  // 收斂過的 token 才拿來比對：空 token 不列（印出來是一片空白，等於沒講），
+  // 重複的只列一次——一份把同一個錯字報三遍的警告，會讓人開始略過整行警告。
+  return effective([...filter.only, ...filter.skip]).filter((token) => !available.has(token));
 }
 
 /**
  * 一行人話摘要，給終端與報告抬頭用。
  *
  * 沒有過濾時回空字串，讓呼叫端能直接 `if (line) print(line)`：這是唯一一種「什麼都不說」算誠實的
- * 情形——沒有過濾的報告本來就涵蓋全部。反過來，只要有過濾就一定要印，而且「沒跑到不等於沒問題」
- * 要寫在同一行，因為這行字很可能是讀者唯一會注意到涵蓋範圍被縮小過的地方。
+ * 情形——沒有過濾的報告本來就涵蓋全部。
+ *
+ * 回傳的是一段**可以嵌進別人句子裡的片語**（`只執行 health；略過 cors`），不是一個完整句子，也不
+ * 自帶「檢查過濾：」之類的抬頭。這不是排版潔癖：呼叫端拿它去組自己的句子，cli.ts 就有兩處
+ * （`檢查範圍：X` 與被過濾檢查的跳過理由 `依 X 排除，本輪未執行——未執行不等於通過。`）。
+ * 自帶抬頭會變成「檢查範圍：檢查過濾：…」的疊字，自帶整句則會讓後者的句法整個崩掉——而那句話會
+ * 原樣寫進每一個被過濾檢查的 skippedReason，出現在 console／markdown／html／junit 全部輸出裡。
+ * 讀者看到語意不通的字串，第一個結論不會是「這裡有個排版問題」，而是「這份報告不太可靠」。
+ *
+ * 「未執行不等於通過」的提醒不放在這裡，是因為它屬於框住這段片語的那個句子：cli.ts 兩處各自都寫了，
+ * 四個報告層也各自印了自己的涵蓋範圍告示。同一行裡重複兩次的提醒不會讓人更警覺，只會被當成雜訊。
+ *
+ * token 用收斂過的版本：摘要必須跟實際判定完全一致。摘要寫「只執行 cors、cors」或印出沒生效的空白
+ * token，讀者就無法用這行字回推「這份報告到底涵蓋了什麼」——而這行字通常是他唯一的線索。
  */
 export function describeFilter(filter: CheckFilter): string {
+  const only = effective(filter.only);
+  const skip = effective(filter.skip);
   const parts: string[] = [];
-  if (filter.only.length > 0) parts.push(`只執行 ${filter.only.join("、")}`);
-  if (filter.skip.length > 0) parts.push(`略過 ${filter.skip.join("、")}`);
-  if (parts.length === 0) return "";
-  return `檢查過濾：${parts.join("，")}——其餘檢查本次沒有執行，會以「被過濾」列在跳過區，不代表通過。`;
+  if (only.length > 0) parts.push(`只執行 ${only.join("、")}`);
+  if (skip.length > 0) parts.push(`略過 ${skip.join("、")}`);
+  // 分隔用「；」與報告層的涵蓋範圍告示一致：同一件事在不同輸出上長得一樣，讀者才不會以為是兩件事。
+  return parts.join("；");
 }
 
 const CATEGORY_LIST = ["security", "availability", "page", "a11y", "integrity", "monitoring"] as const;
