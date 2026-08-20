@@ -6,7 +6,8 @@
  * 導致其他 20 項本來會抓到的問題全都沒跑到。所以每一項都包在 `safely` 裡，
  * 例外被轉成 `error` 欄位（與「發現問題」分開統計），其餘照跑。
  */
-import { countBySeverity, severityRank, shouldFail, worstSeverity } from "./severity.js";
+import { countBySeverity, severityRank, worstSeverity } from "./severity.js";
+import { hasNewFindings } from "./baseline.js";
 import type { CheckResult, RunReport, SentinelConfig, Severity, Surface } from "./types.js";
 
 export type CheckTask = () => Promise<CheckResult>;
@@ -116,15 +117,10 @@ export function exitCodeFor(report: RunReport, failOn: Severity, options: { only
   if (completed === 0) return 3;
   if (errored > 0 && worst === null) return 2;
 
-  if (options.onlyNew && report.diff) {
-    const regressions = [...report.diff.added, ...report.diff.changed.filter((c) => isWorse(c.before.severity, c.after.severity)).map((c) => c.after)];
-    return shouldFail(regressions, failOn) ? 1 : 0;
-  }
+  // 判準委派給 baseline.ts，不在這裡另寫一份「什麼算惡化」。
+  // 兩份門檻邏輯遲早會走偏，而走偏的那天不會有人發現——只會發現某天 CI 突然不擋了。
+  if (options.onlyNew && report.diff) return hasNewFindings(report.diff, failOn) ? 1 : 0;
 
   if (!worst) return 0;
   return severityRank(worst) <= severityRank(failOn) ? 1 : 0;
-}
-
-function isWorse(before: Severity, after: Severity): boolean {
-  return severityRank(after) < severityRank(before);
 }

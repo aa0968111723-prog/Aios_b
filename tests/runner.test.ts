@@ -36,6 +36,7 @@ const report = (over: Partial<RunReport["summary"]> = {}): RunReport => ({
     completed: 1,
     skipped: 0,
     errored: 0,
+    suppressed: 0,
     findings: { critical: 0, high: 0, medium: 0, low: 0, info: 0 },
     worst: null,
     ...over,
@@ -125,5 +126,52 @@ describe("exitCodeFor", () => {
 
   it("全部跳過時，即使門檻很寬也不回 0", () => {
     expect(exitCodeFor(report({ completed: 0, skipped: 3, total: 3 }), "info")).toBe(3);
+  });
+});
+
+/**
+ * `--fail-on-new` 的語意測試。
+ *
+ * 這個模式最容易寫出的錯誤是「有基準就一律放行」——那會讓存量的 critical 永遠沒人處理，
+ * 也會讓一筆 low 悄悄變成 critical 而不被擋下。所以這裡逐條把語意釘死。
+ */
+describe("exitCodeFor — --fail-on-new", () => {
+  const f = (id: string, severity: Severity) =>
+    finding({ id, check: "t", category: "security", surface: "web", severity, title: id, detail: "d", remediation: "r" });
+
+  const withDiff = (diff: Partial<NonNullable<RunReport["diff"]>>, worst: Severity | null): RunReport => ({
+    ...report({ worst }),
+    diff: { baselineTarget: null, baselineStartedAt: null, added: [], fixed: [], unchanged: [], changed: [], ...diff },
+  });
+
+  it("只有存量問題時放行——既有專案才導得進來", () => {
+    expect(exitCodeFor(withDiff({ unchanged: [f("a", "critical")] }, "critical"), "high", { onlyNew: true })).toBe(0);
+  });
+
+  it("新增達門檻就擋下", () => {
+    expect(exitCodeFor(withDiff({ added: [f("b", "high")] }, "high"), "high", { onlyNew: true })).toBe(1);
+  });
+
+  it("新增但未達門檻不擋", () => {
+    expect(exitCodeFor(withDiff({ added: [f("c", "low")] }, "low"), "high", { onlyNew: true })).toBe(0);
+  });
+
+  it("嚴重度惡化等同新增——危害不會因為它上次就在而減少", () => {
+    const changed = [{ key: "d::", before: f("d", "low"), after: f("d", "critical") }];
+    expect(exitCodeFor(withDiff({ changed }, "critical"), "high", { onlyNew: true })).toBe(1);
+  });
+
+  it("嚴重度減輕不算惡化", () => {
+    const changed = [{ key: "e::", before: f("e", "critical"), after: f("e", "low") }];
+    expect(exitCodeFor(withDiff({ changed }, "low"), "high", { onlyNew: true })).toBe(0);
+  });
+
+  it("沒有基準可比時退回一般判準——不能因為拿不到基準就放行", () => {
+    expect(exitCodeFor(report({ worst: "critical" as Severity }), "high", { onlyNew: true })).toBe(1);
+  });
+
+  it("什麼都沒跑到仍然回 3，優先於新增判定", () => {
+    const nothing = { ...withDiff({ added: [f("g", "critical")] }, "critical"), summary: { ...report().summary, completed: 0, total: 3, skipped: 3 } };
+    expect(exitCodeFor(nothing, "high", { onlyNew: true })).toBe(3);
   });
 });
