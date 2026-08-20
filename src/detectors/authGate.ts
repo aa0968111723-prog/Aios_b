@@ -110,17 +110,29 @@ export function trpcBlocked(body: string): boolean {
     const parsed: unknown = JSON.parse(body);
     const entries = Array.isArray(parsed) ? parsed : [parsed];
     return entries.some((entry) => {
-      const err = (entry as { error?: { data?: { code?: string }; message?: string } })?.error;
-      if (!err) return false;
-      const code = err.data?.code ?? "";
-      return /UNAUTHORIZED|FORBIDDEN/i.test(code) || /登入|未授權/.test(err.message ?? "");
+      const raw = (entry as { error?: unknown })?.error;
+      if (!raw || typeof raw !== "object") return false;
+
+      // 設了 transformer（ai_os 用 superjson）時，錯誤內容會被包在 error.json 底下。
+      // 舊版直接讀 error.data.code，於是拿到 undefined，把一個「正確擋下了」的回應
+      // 判成「未授權卻回了結果」——一筆假的 critical。
+      const err = ((raw as { json?: unknown }).json ?? raw) as {
+        data?: { code?: string; httpStatus?: number };
+        code?: number;
+        message?: string;
+      };
+
+      if (/UNAUTHORIZED|FORBIDDEN/i.test(err.data?.code ?? "")) return true;
+      if (err.data?.httpStatus === 401 || err.data?.httpStatus === 403) return true;
+      // tRPC 的 JSON-RPC 錯誤碼：-32001 UNAUTHORIZED、-32003 FORBIDDEN。
+      if (err.code === -32001 || err.code === -32003) return true;
+      return /登入|未授權|unauthori[sz]ed|forbidden/i.test(err.message ?? "");
     });
   } catch {
     return false;
   }
 }
 
-/** 回應看起來像不像「有實際資料」——用來分辨真外洩與空殼 200。 */
 export function looksLikeData(body: string, contentType: string): boolean {
   if (/application\/(zip|gzip|octet-stream)|text\/csv/i.test(contentType)) return body.length > 0;
   try {

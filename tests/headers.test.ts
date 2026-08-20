@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { analyzeSecurityHeaders } from "../src/detectors/headers.js";
+import { analyzeCsp } from "../src/detectors/csp.js";
 
 const httpsCtx = { surface: "web" as const, where: "https://example.test/", https: true };
 const httpCtx = { surface: "web" as const, where: "http://localhost:3000/", https: false };
@@ -93,5 +94,72 @@ describe("analyzeSecurityHeaders", () => {
       httpsCtx,
     );
     expect(ids(findings)).toContain("csp.script-src.unsafe-eval");
+  });
+});
+
+/**
+ * CSP 只寫在 meta 標籤時的判定。
+ *
+ * 舊版一律報「缺少 Content-Security-Policy」（high），detail 還寫著「任何被注入的腳本都能
+ * 直接執行」——但瀏覽器確實在執行那份 meta 政策，敘述根本不成立。說錯話的告警只要被抓到
+ * 一次，讀者就不會再相信整份報告。
+ */
+describe("analyzeCsp — meta 版本的政策", () => {
+  const ctx = { surface: "web" as const, where: "https://example.test/" };
+  const ids = (f: ReturnType<typeof analyzeCsp>) => f.map((x) => x.id);
+
+  it("標頭沒有但 meta 有時，不報「缺少 CSP」", () => {
+    const findings = analyzeCsp(null, { ...ctx, metaCsp: "default-src 'self'; script-src 'self'" });
+    expect(ids(findings)).not.toContain("csp.missing");
+    expect(findings.find((f) => f.id === "csp.header-missing-meta-only")?.severity).toBe("medium");
+  });
+
+  it("meta 的政策仍會做指令級分析", () => {
+    const findings = analyzeCsp(null, { ...ctx, metaCsp: "default-src 'self'; script-src 'self' 'unsafe-eval'" });
+    expect(ids(findings)).toContain("csp.script-src.unsafe-eval");
+  });
+
+  it("meta 裡的 frame-ancestors 會被瀏覽器忽略，所以照樣算沒有防護", () => {
+    const findings = analyzeCsp(null, { ...ctx, metaCsp: "default-src 'self'; frame-ancestors 'none'" });
+    expect(ids(findings)).toContain("csp.frame-ancestors");
+  });
+
+  it("兩邊都沒有才是真的缺少 CSP", () => {
+    expect(ids(analyzeCsp(null, { ...ctx, metaCsp: null }))).toEqual(["csp.missing"]);
+  });
+
+  it("有標頭時以標頭為準，不受 meta 影響", () => {
+    const findings = analyzeCsp("default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'", {
+      ...ctx,
+      metaCsp: "script-src 'unsafe-eval'",
+    });
+    expect(ids(findings)).not.toContain("csp.script-src.unsafe-eval");
+    expect(ids(findings)).not.toContain("csp.header-missing-meta-only");
+  });
+});
+
+/**
+ * `'strict-dynamic'`：業界建議的嚴格 CSP 寫法，卻最容易被掃描器誤報。
+ *
+ * 依 CSP3 規格，來源清單一旦含 'strict-dynamic'，所有 host-source 與 scheme-source
+ * （含 https:）與 'unsafe-inline' 都會被瀏覽器忽略——那些 https: 是刻意留給舊瀏覽器的回退值。
+ */
+describe("analyzeCsp — strict-dynamic", () => {
+  const ctx = { surface: "web" as const, where: "https://example.test/" };
+  const ids = (f: ReturnType<typeof analyzeCsp>) => f.map((x) => x.id);
+
+  it("有 nonce 的 strict-dynamic 不報過寬來源", () => {
+    const findings = analyzeCsp("script-src 'nonce-r4nd0m' 'strict-dynamic' https: 'unsafe-inline'; default-src 'self'", ctx);
+    expect(ids(findings)).not.toContain("csp.script-src.wildcard");
+    expect(ids(findings)).not.toContain("csp.script-src.unsafe-inline");
+  });
+
+  it("但沒有 nonce 的 strict-dynamic 是真的有問題——兩種結局都不是本意", () => {
+    const findings = analyzeCsp("script-src 'strict-dynamic' https:; default-src 'self'", ctx);
+    expect(findings.find((f) => f.id === "csp.script-src.strict-dynamic-without-nonce")?.severity).toBe("high");
+  });
+
+  it("沒有 strict-dynamic 時 https: 照樣算過寬", () => {
+    expect(ids(analyzeCsp("script-src 'self' https:; default-src 'self'", ctx))).toContain("csp.script-src.wildcard");
   });
 });

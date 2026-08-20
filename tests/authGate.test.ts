@@ -149,4 +149,26 @@ describe("trpcBlocked", () => {
   it("不是 JSON 時回 false（由呼叫端先排除兜底頁，這裡不猜）", () => {
     expect(trpcBlocked("<!doctype html>")).toBe(false);
   });
+
+  // ai_os 用 superjson 當 transformer，於是錯誤內容被包在 error.json 底下。
+  // 認不得這層外殼，會把一個「正確擋下了」的回應判成「未授權卻回了結果」——一筆假的 critical。
+  it("認得 superjson transformer 的外殼", () => {
+    const single = '{"error":{"json":{"message":"UNAUTHORIZED","code":-32001,"data":{"code":"UNAUTHORIZED","httpStatus":401}}}}';
+    expect(trpcBlocked(single)).toBe(true);
+    expect(trpcBlocked(`[${single}]`)).toBe(true);
+  });
+
+  it("只靠 httpStatus 或 JSON-RPC 錯誤碼也判得出來", () => {
+    expect(trpcBlocked('{"error":{"data":{"httpStatus":403}}}')).toBe(true);
+    expect(trpcBlocked('{"error":{"code":-32003}}')).toBe(true);
+  });
+
+  it("英文訊息也算——放寬的代價遠低於把正確防護報成 critical 外洩", () => {
+    expect(trpcBlocked('{"error":{"message":"Unauthorized"}}')).toBe(true);
+    expect(trpcBlocked('{"error":{"message":"Forbidden"}}')).toBe(true);
+  });
+
+  it("真的回了資料就不算擋下（放寬不能寬到把外洩也吃掉）", () => {
+    expect(trpcBlocked('{"error":{"json":{"message":"Something failed","data":{"code":"INTERNAL_SERVER_ERROR"}}}}')).toBe(false);
+  });
 });

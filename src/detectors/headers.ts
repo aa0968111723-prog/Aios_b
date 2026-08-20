@@ -13,6 +13,8 @@ export interface HeaderContext {
   where: string;
   /** 目標是否走 https。HSTS 只在 https 下有意義，本機 http 測試不該被誤報。 */
   https: boolean;
+  /** HTML 裡的 meta CSP。標頭沒有 CSP 但 meta 有時，那份政策確實在生效——見 analyzeCsp。 */
+  metaCsp?: string | null;
 }
 
 /** Headers → 小寫鍵的普通物件，方便測試直接餵字面量。 */
@@ -227,7 +229,7 @@ export function analyzeSecurityHeaders(headers: Record<string, string>, ctx: Hea
   }
 
   // CSP 交給專門的分析器（它有完整的指令級規則）
-  out.push(...analyzeCsp(csp, { surface: ctx.surface, where: ctx.where, check: "security-headers" }));
+  out.push(...analyzeCsp(csp, { surface: ctx.surface, where: ctx.where, check: "security-headers", metaCsp: ctx.metaCsp ?? null }));
 
   return out;
 }

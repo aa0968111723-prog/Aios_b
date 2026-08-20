@@ -42,6 +42,13 @@ export interface CspContext {
   surface: SurfaceId | "all";
   where: string;
   check?: string;
+  /**
+   * HTML 裡的 `<meta http-equiv="Content-Security-Policy">` 政策。
+   *
+   * 標頭沒有 CSP 但 meta 有時，瀏覽器**確實在執行**那份政策——此時報「缺少 CSP」
+   * 並說「任何被注入的腳本都能直接執行」是錯的敘述，而錯的敘述會讓讀者停止相信報告。
+   */
+  metaCsp?: string | null;
 }
 
 /**
@@ -52,7 +59,11 @@ export function analyzeCsp(header: string | null, ctx: CspContext): Finding[] {
   const base = { check, category: "security" as const, surface: ctx.surface, where: ctx.where };
   const out: Finding[] = [];
 
-  if (!header || header.trim() === "") {
+  const hasHeader = Boolean(header && header.trim() !== "");
+  const metaOnly = !hasHeader && Boolean(ctx.metaCsp && ctx.metaCsp.trim() !== "");
+  const policy = hasHeader ? (header as string) : metaOnly ? (ctx.metaCsp as string) : null;
+
+  if (policy === null) {
     return [
       finding({
         ...base,
@@ -67,8 +78,28 @@ export function analyzeCsp(header: string | null, ctx: CspContext): Finding[] {
     ];
   }
 
-  const directives = parseCsp(header);
-  const evidence = header.length > 400 ? `${header.slice(0, 400)}…` : header;
+  const directives = parseCsp(policy);
+  const evidence = policy.length > 400 ? `${policy.slice(0, 400)}…` : policy;
+
+  if (metaOnly) {
+    // meta 版本是真的在生效，所以不能報「缺少 CSP」；但它有兩個規格層級的限制，
+    // 而這兩個限制正好蓋掉 CSP 最重要的兩項用途，值得單獨講清楚。
+    out.push(
+      finding({
+        ...base,
+        id: "csp.header-missing-meta-only",
+        severity: "medium",
+        title: "CSP 只存在於 HTML 的 meta 標籤，沒有標頭版本",
+        detail:
+          "meta 版本的政策確實會生效，但依規格有兩個限制：`frame-ancestors` 與違規回報端點在 meta 版本會被瀏覽器" +
+          "**直接忽略**（於是點擊劫持防護等於沒有），而且政策要等 HTML 解析到那一行才開始套用——在那之前載入的資源不受保護。",
+        remediation: "把同一份政策改由伺服器以 Content-Security-Policy 標頭送出（helmet 的 contentSecurityPolicy）。",
+        evidence,
+      }),
+    );
+    // frame-ancestors 在 meta 版本無效，所以後續判定要當它不存在——否則會因為「你寫了」而放行。
+    directives.delete("frame-ancestors");
+  }
 
   if (!directives.has("default-src")) {
     out.push(
@@ -127,7 +158,30 @@ export function analyzeCsp(header: string | null, ctx: CspContext): Finding[] {
         }),
       );
     }
-    const wildcards = script.sources.filter((s) => WILDCARD_SCHEMES.has(s));
+    // 'strict-dynamic' 會讓所有 host-source 與 scheme-source（含 https:）與 'unsafe-inline'
+    // 被瀏覽器**忽略**，只有帶 nonce／hash 的腳本及其動態載入的腳本能執行。
+    // 那些 https: 是刻意留給不支援 strict-dynamic 的舊瀏覽器的回退值——把業界建議的嚴格
+    // CSP 報成「信任整個網際網路」，是這條規則最容易犯的錯。
+    const strictDynamic = script.sources.includes("'strict-dynamic'");
+    const wildcards = strictDynamic ? [] : script.sources.filter((s) => WILDCARD_SCHEMES.has(s));
+
+    if (strictDynamic && !script.sources.some((s) => s.startsWith("'nonce-") || s.startsWith("'sha"))) {
+      out.push(
+        finding({
+          ...base,
+          id: "csp.script-src.strict-dynamic-without-nonce",
+          severity: "high",
+          title: "script-src 使用 'strict-dynamic' 卻沒有 nonce／hash",
+          detail:
+            "'strict-dynamic' 的意思是「只信任帶 nonce／hash 的腳本」，但這份政策一個 nonce 或 hash 都沒有。" +
+            "同時它又會讓所有 host 與 scheme 來源失效，結果是頁面上的腳本全被擋掉（功能壞掉），" +
+            "或在舊瀏覽器上退回那些萬用來源（防護等於沒有）——兩種結局都不是本意。",
+          remediation: "在伺服器端為每個 inline／必要腳本產生 nonce 並寫進 script-src；或移除 'strict-dynamic'。",
+          evidence,
+        }),
+      );
+    }
+
     if (wildcards.length > 0) {
       out.push(
         finding({

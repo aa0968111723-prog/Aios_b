@@ -13,6 +13,22 @@ import type { CheckResult, Finding, Surface } from "../core/types.js";
 /** 明顯不屬於任何自家部署的來源，用來測反射。 */
 const EVIL_ORIGIN = "https://sentinel-cors-probe.invalid";
 
+/**
+ * 把來源正規化成可比對的形式。
+ *
+ * 直接用 `===` 比會漏掉最常見的一種反射寫法：伺服器把 Origin 正規化後回填
+ * （`new URL(req.headers.origin).href` 會多出尾端斜線），或大小寫不同。
+ * 那時 `===` 不成立、值也不是 `*` 或 `null`，於是一個「反射任意 Origin ＋ allow-credentials」
+ * 的 critical 漏洞會得到零發現——這是這個偵測器最嚴重的失效方式。
+ */
+export function normalizeOrigin(value: string): string {
+  try {
+    return new URL(value).origin.toLowerCase();
+  } catch {
+    return value.trim().replace(/\/+$/, "").toLowerCase();
+  }
+}
+
 export interface CorsObservation {
   allowOrigin: string | null;
   allowCredentials: string | null;
@@ -32,7 +48,7 @@ export function analyzeCors(
     `Access-Control-Allow-Credentials: ${obs.allowCredentials ?? "（無）"}`,
   ].join("\n");
 
-  if (obs.allowOrigin === ctx.sentOrigin) {
+  if (obs.allowOrigin && normalizeOrigin(obs.allowOrigin) === normalizeOrigin(ctx.sentOrigin)) {
     out.push(
       finding({
         ...base,
@@ -99,24 +115,50 @@ export async function checkCors(surface: Surface, timeoutMs: number): Promise<Ch
   for (const path of targets) {
     const url = join(surface.origin, path);
 
-    // 預檢請求：CORS 設定通常掛在 OPTIONS 上，只測 GET 會漏掉。
-    const preflight = await tryProbe(url, {
+    // 觀測反射一律用 GET。
+    //
+    // 舊版送 POST——註解說那是「預檢」，但 POST 不是預檢，而且 POST 到 /api/v1/databases
+    // 是**寫入方法**：萬一該端點真的沒擋，掃描本身就會在使用者的正式資料庫上建東西。
+    // 檢測系統不該污染它要測量的東西，所以這裡只送讀取方法。
+    const reflect = await tryProbe(url, {
       surface,
       timeoutMs,
-      method: "POST", // 用 fetch 送 OPTIONS 會被部分執行環境改寫，改以帶 Origin 的實際請求觀測
+      method: "GET",
       headers: { origin: EVIL_ORIGIN },
       followRedirects: 0,
       maxBodyBytes: 8 * 1024,
     });
-    if (isProbeFailure(preflight)) continue;
+    if (isProbeFailure(reflect)) continue;
+
+    // Access-Control-Allow-Methods／Allow-Headers 依規格只出現在 OPTIONS 回應上
+    // （express 的 cors 套件也是這樣實作）。所以要看預檢就得真的送一次 OPTIONS——
+    // 從 GET 回應去讀那兩個標頭永遠是 null，而把 null 寫進報告會被讀成
+    //「預檢查過、沒放行任何方法」，實際上是根本沒測。
+    const preflight = await tryProbe(url, {
+      surface,
+      timeoutMs,
+      method: "OPTIONS",
+      headers: {
+        origin: EVIL_ORIGIN,
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "content-type",
+      },
+      followRedirects: 0,
+      maxBodyBytes: 4 * 1024,
+    });
 
     const obs: CorsObservation = {
-      allowOrigin: preflight.headers.get("access-control-allow-origin"),
-      allowCredentials: preflight.headers.get("access-control-allow-credentials"),
-      allowMethods: preflight.headers.get("access-control-allow-methods"),
-      allowHeaders: preflight.headers.get("access-control-allow-headers"),
+      allowOrigin: reflect.headers.get("access-control-allow-origin"),
+      allowCredentials: reflect.headers.get("access-control-allow-credentials"),
+      allowMethods: isProbeFailure(preflight) ? null : preflight.headers.get("access-control-allow-methods"),
+      allowHeaders: isProbeFailure(preflight) ? null : preflight.headers.get("access-control-allow-headers"),
     };
-    facts[path] = obs;
+
+    facts[path] = {
+      ...obs,
+      // 「沒觀測到」與「觀測到沒有」必須分得開，連在 facts 裡也一樣。
+      preflight: isProbeFailure(preflight) ? `未觀測（${preflight.error}）` : `HTTP ${preflight.status}`,
+    };
 
     if (!obs.allowOrigin) continue; // 完全沒有 CORS 標頭＝同源限制生效，這是最安全的預設
     findings.push(...analyzeCors(obs, { surface: surface.id, where: url, sentOrigin: EVIL_ORIGIN }));

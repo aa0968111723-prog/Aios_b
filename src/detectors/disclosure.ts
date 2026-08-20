@@ -164,7 +164,41 @@ export async function checkDisclosure(surface: Surface, timeoutMs: number): Prom
       const bundleUrl = join(surface.origin, bundle);
       const js = await tryProbe(bundleUrl, { surface, timeoutMs, maxBodyBytes: 2 * 1024 * 1024 });
       if (!isProbeFailure(js)) {
-        const mapRef = /\/\/#\s*sourceMappingURL=(\S+)/.exec(js.body)?.[1];
+        // sourceMappingURL 依定義在**檔尾**，而 bundle 讀到 2MB 就會被截斷。
+        // 大型 React 應用的 entry chunk 超過 2MB 很常見，於是那一行永遠找不到，
+        // 檢查靜靜地通過——而 source map 就在線上等著被下載。
+        let text = js.body;
+        if (js.truncated) {
+          const tail = await tryProbe(bundleUrl, {
+            surface,
+            timeoutMs,
+            headers: { range: "bytes=-4096" },
+            maxBodyBytes: 8 * 1024,
+          });
+          if (!isProbeFailure(tail) && tail.status === 206) {
+            text = tail.body;
+          } else {
+            // Range 不被支援時就是真的驗不到。這種情況必須說出來——
+            // 沉默通過會讓讀者以為「正式站沒有 source map」已經被查過了。
+            facts.sourcemapUnverified = bundleUrl;
+            findings.push(
+              finding({
+                ...base,
+                id: "disclosure.sourcemap.unverified",
+                severity: "low",
+                title: "主要 bundle 超過讀取上限，source map 未驗證",
+                detail:
+                  "sourceMappingURL 註記在檔案最尾端，而這支 bundle 超過本工具的讀取上限、" +
+                  "伺服器又不支援 Range 請求，所以檔尾沒被讀到。**本輪沒有驗證正式站是否附帶 source map**——" +
+                  "不是沒有，是沒看到。",
+                remediation: `手動確認 ${bundleUrl}.map 是否可下載；或讓靜態伺服器支援 Range 請求。`,
+                evidence: bundleUrl,
+                where: bundleUrl,
+              }),
+            );
+          }
+        }
+        const mapRef = /\/\/#\s*sourceMappingURL=(\S+)/.exec(text)?.[1];
         if (mapRef && !mapRef.startsWith("data:")) {
           const mapUrl = new URL(mapRef, bundleUrl).toString();
           const map = await tryProbe(mapUrl, { surface, timeoutMs, maxBodyBytes: 16 * 1024 });
@@ -221,8 +255,16 @@ export async function checkDisclosure(surface: Surface, timeoutMs: number): Prom
     const res = await tryProbe(url, { surface, timeoutMs, followRedirects: 0, maxBodyBytes: 16 * 1024 });
     if (isProbeFailure(res) || res.status !== 200) continue;
     const contentType = res.headers.get("content-type") ?? "";
-    if (looksLikeSpaFallback(res.body, contentType)) continue;
-    if (/<title>Index of|Directory listing for/i.test(res.body)) {
+    // 順序很重要：目錄索引的特徵要先比對。
+    //
+    // looksLikeSpaFallback 把任何帶 <!doctype html> 的頁面都當成 SPA 兜底，而目錄索引
+    // （Python http.server 輸出的就是 `<!DOCTYPE HTML>` + `Directory listing for /uploads/`）
+    // 正好命中那條，於是這個檢查從來沒有機會執行過。
+    // 不改 looksLikeSpaFallback 本身，是因為那條寬鬆判準在 disclosure 的檔案探測上是對的：
+    // 那裡寧可漏報也不要對每一條 SPA 路徑噴假警報。
+    const isDirListing = /<title>\s*Index of|Directory listing for/i.test(res.body);
+    if (!isDirListing && looksLikeSpaFallback(res.body, contentType)) continue;
+    if (isDirListing) {
       findings.push(
         finding({
           ...base,

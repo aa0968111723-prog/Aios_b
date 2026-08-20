@@ -18,7 +18,15 @@ export interface ProbeResponse {
   body: string;
   truncated: boolean;
   durationMs: number;
-  /** Set-Cookie 原始值。Headers.get 會把多個 cookie 併成一行導致無法解析，故走 getSetCookie。 */
+  /**
+   * **整條重導向鏈上**的 Set-Cookie 原始值（依序）。
+   *
+   * 不是只有最終回應：express-session 的預設行為就是在第一個回應上種 cookie，
+   * 而那個回應常常正是 302。只取最終落點的話，站台真正的會話 Cookie 完全不會被稽核——
+   * 檢查照樣完成、照樣零發現。
+   *
+   * Headers.get 會把多個 cookie 併成一行導致無法解析，故走 getSetCookie。
+   */
   setCookies: string[];
 }
 
@@ -45,6 +53,12 @@ export class ProbeError extends Error {
 }
 
 const DEFAULT_MAX_BODY = 512 * 1024;
+
+/** getSetCookie 在 Node 20+ 的 undici Headers 上可用；舊環境退回單行值。 */
+function readSetCookies(headers: Headers): string[] {
+  if (typeof headers.getSetCookie === "function") return headers.getSetCookie();
+  return [headers.get("set-cookie")].filter(Boolean) as string[];
+}
 
 /** 把 surface 人格（UA、殼層標頭）疊到請求上。呼叫端明確給的標頭優先。 */
 function headersFor(options: ProbeOptions): Record<string, string> {
@@ -101,6 +115,7 @@ export async function probe(url: string, options: ProbeOptions = {}): Promise<Pr
   let current = url;
   let hops = 0;
   const startedAt = Date.now();
+  const setCookies: string[] = [];
 
   for (;;) {
     let res: Response;
@@ -123,6 +138,8 @@ export async function probe(url: string, options: ProbeOptions = {}): Promise<Pr
     if (isRedirect && hops < maxHops) {
       const next = new URL(location, current).toString();
       redirects.push({ from: current, to: next, status: res.status });
+      // 這一跳種下的 Cookie 要留著——會話 Cookie 常常就種在重導向那個回應上。
+      setCookies.push(...readSetCookies(res.headers));
       // 讀掉 body 避免連線洩漏；重導向的 body 對判定沒有價值。
       await res.body?.cancel().catch(() => {});
       current = next;
@@ -142,10 +159,7 @@ export async function probe(url: string, options: ProbeOptions = {}): Promise<Pr
       body,
       truncated,
       durationMs: Date.now() - startedAt,
-      // getSetCookie 在 Node 20+ 的 undici Headers 上可用；舊環境退回單行值。
-      setCookies: typeof res.headers.getSetCookie === "function"
-        ? res.headers.getSetCookie()
-        : ([res.headers.get("set-cookie")].filter(Boolean) as string[]),
+      setCookies: [...setCookies, ...readSetCookies(res.headers)],
     };
   }
 }
