@@ -71,6 +71,18 @@ const ATTEMPT_INTERVAL_MS = 400;
 const FAILURE_STATUSES = new Set([400, 401, 403, 422]);
 
 /**
+ * 這幾個狀態一定是**應用自己**回的：沒有中介層會拿 400／401／422 來擋人
+ * （代理、WAF、平台閘道用的是 403、502、503）。
+ *
+ * 分出這個集合是為了 `looksLikeLoginEndpoint`：那裡不能對這些狀態動用攔截啟發式。
+ * `looksLikeGatewayInterception` 找的是 SPA 外殼或 `error`／`ok`／`code` 欄位，
+ * 而一個再正常不過的登入端點，對錯誤憑證常常只回一個空 body 的 401，
+ * 或 `{"message":"帳號或密碼錯誤"}`——兩者都不含那些特徵，於是會被判成「被攔截」。
+ * 後果是整項檢查在最標準的登入端點上直接跳過，而且沒有人會發現：跳過看起來永遠無害。
+ */
+const APP_ONLY_FAILURE_STATUSES = new Set([400, 401, 422]);
+
+/**
  * 要下「沒有速率限制」這個結論，至少需要幾筆樣本。
  *
  * 一兩次失敗就說對方沒設限是不誠實的：現實中不存在第 2 次就啟動的限制器，
@@ -97,6 +109,11 @@ const BACKOFF_STEP_RATIO = 1.2;
  */
 export type ProbeAccountKind = "nonexistent" | "possible";
 
+/** 標頭值是否真的有內容。空字串等同沒有——把 `Retry-After: ` 當成證據會憑空生出一筆正面觀測。 */
+function present(value: string | null): boolean {
+  return (value ?? "").trim() !== "";
+}
+
 export interface RateLimitSample {
   /** 第幾次嘗試（從 1 起算）。報告要能說出「第幾次才被擋下來」。 */
   attempt: number;
@@ -115,6 +132,45 @@ export interface RateLimitOptions {
   enabled: boolean;
   attempts?: number;
   loginPath?: string;
+}
+
+/**
+ * 這個回應到底是不是登入端點回的。
+ *
+ * 拉成純函式，是因為它是本檢查最關鍵、也最容易兩邊都判錯的一個決定：
+ * 判成「不是」會讓整項靜靜跳過（一份看起來無害的報告，其實什麼都沒測）；
+ * 判成「是」則會把中介層的封鎖頁當成登入失敗，最後報出一筆不存在的 high。
+ *
+ * 判準，依序：
+ * - 404／405／501：這個位址上沒掛登入，或它不收 POST。
+ * - 400／401／422：一定是應用回的，直接採信（理由見 `APP_ONLY_FAILURE_STATUSES`）。
+ * - SPA 兜底頁：Vite 對未知路徑一律回 index.html，那正是「這裡什麼都沒有」的長相。
+ * - 其餘狀態（含 403）才交給攔截啟發式。403 特別曖昧：它既是某些站台的「憑證不對」，
+ *   也是防火牆最愛用的封鎖碼，所以要求回應內容看起來確實出自應用才採信——
+ *   把 WAF 的封鎖頁收進樣本，會讓連續 6 次封鎖被報成「連續 6 次失敗都沒有被限制」。
+ */
+export function looksLikeLoginEndpoint(res: { status: number; body: string; contentType: string }): boolean {
+  if (res.status === 404 || res.status === 405 || res.status === 501) return false;
+  if (APP_ONLY_FAILURE_STATUSES.has(res.status)) return true;
+  if (looksLikeSpaFallback(res.body, res.contentType)) return false;
+  return !looksLikeGatewayInterception(res);
+}
+
+/**
+ * 從回應標頭取出「剩餘可用次數」。
+ *
+ * 三種寫法都要認：`RateLimit-Remaining`（IETF draft-6，express-rate-limit 的預設）、
+ * `X-RateLimit-Remaining`（舊慣例），以及 draft-7／8 把三個值併成一行的
+ * `RateLimit: limit=5, remaining=3, reset=60`。少認最後那種的代價很具體：
+ * 一個用新版標頭、門檻又設得比本輪次數高的站台，會完全看不到限制器的痕跡，
+ * 於是一份有防護的部署被報成 `absent`（high）。
+ */
+export function readRateLimitRemaining(get: (name: string) => string | null): string | null {
+  const direct = get("ratelimit-remaining") ?? get("x-ratelimit-remaining");
+  if (present(direct)) return direct;
+  // 只取 remaining 這一項；正則沒有巢狀量詞，畸形輸入不會造成災難性回溯。
+  const combined = get("ratelimit") ?? "";
+  return /(?:^|[,;\s])remaining\s*=\s*(\d+)/i.exec(combined)?.[1] ?? null;
 }
 
 /**
@@ -147,11 +203,6 @@ export function looksLikeBackoff(durations: number[]): boolean {
     if (current >= prev * BACKOFF_STEP_RATIO) rising += 1;
   }
   return rising >= Math.ceil((durations.length - 1) / 2);
-}
-
-/** 標頭值是否真的有內容。空字串等同沒有——把 `Retry-After: ` 當成證據會憑空生出一筆正面觀測。 */
-function present(value: string | null): boolean {
-  return (value ?? "").trim() !== "";
 }
 
 type ThrottleSignal =

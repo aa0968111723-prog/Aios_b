@@ -23,6 +23,12 @@
  * 2. SPA 的 catch-all 路由會對任何方法回 index.html 200，TRACE 也不例外。
  *    那不是站台支援 TRACE，只是兜底路由接走了；照 200 判定會產出整排假的 medium。
  *    這種回應一律歸到「未判定」——它既不是有問題，也不是沒問題。
+ * 3. Node／undici 的 fetch 依 Fetch 規範把 TRACE 列為禁用方法，請求在送出前就被自己擋下。
+ *    那是**我們這端的限制**，不是站台拒絕了 TRACE，兩者在報告裡必須看得出差別，
+ *    否則讀者會以為這條路已經查過而且是安全的。
+ *
+ * 上面三種情況都會落到 `methods.trace.unknown`，但確切原因逐路徑寫進 `facts.observed`，
+ * 而且 remediation 會給出可以直送 TRACE 的補驗指令——「沒測到」要留下能接續的線索。
  */
 import { finding, stopwatch } from "../core/findings.js";
 import { isProbeFailure, join, looksLikeGatewayInterception, tryProbe } from "../core/http.js";
@@ -47,6 +53,9 @@ const WRITE_METHODS = ["PUT", "DELETE", "PATCH"];
 /** 超過這個數量就算「沒有人縮限過路由」。GET／HEAD／POST／OPTIONS 加上一兩個特例已經很寬了。 */
 const VERBOSE_ALLOW_THRESHOLD = 6;
 
+/** 附在報告上的回應片段長度。夠看出是不是回吐即可，不必把整份回應搬進報告。 */
+const SNIPPET_CHARS = 200;
+
 export interface MethodObservation {
   /** 觀測的路徑（不含站台位址）。 */
   path: string;
@@ -61,11 +70,33 @@ export interface MethodObservation {
 }
 
 /**
+ * 一次 TRACE 探針到底測到了什麼。
+ *
+ * 三種狀態刻意分開，因為它們在報告上的意義完全不同：
+ * `answered` 是站台自己的答覆（可以據以判定）；`shadowed` 是應用有回但被 catch-all 兜底頁
+ * 蓋住（我們看不到站台怎麼處理 TRACE，但站台確實活著）；`unreachable` 是根本沒問到站台。
+ * 混成一個布林值，就會出現「代理擋掉」被寫成「站台拒絕 TRACE」這種最糟的誤述。
+ */
+export type TraceProbeState =
+  | { state: "answered"; status: number; echoed: boolean; snippet: string | null }
+  | { state: "shadowed"; reason: string; snippet: string | null }
+  | { state: "unreachable"; reason: string; snippet: string | null };
+
+/** 一次 OPTIONS 探針的結果。`answered` 才有資格拿 Allow 去判定。 */
+export type AllowProbeState =
+  | { state: "answered"; allow: string | null; note: string }
+  | { state: "unverified"; reason: string };
+
+/** 探針的原始素材：不是失敗訊息，就是一份真的收到的回應。 */
+type ProbeOutcome<T> = { error: string } | T;
+
+/**
  * 正規化 Allow 標頭。
  *
  * 大小寫與空白都不是語意的一部分（RFC 9110 的 method 是大小寫敏感的 token，但實務上
  * 各家代理回的大小寫並不一致），統一成大寫再比對，否則 `put` 會漏掉。
  * 去重是因為經過多層代理時同一個方法被列兩次很常見，那不代表它比較危險。
+ * 順序照伺服器寫的順序保留——證據要能跟原始標頭一眼對得起來。
  */
 export function parseAllowHeader(value: string | null): string[] {
   if (!value) return [];
@@ -79,6 +110,86 @@ export function parseAllowHeader(value: string | null): string[] {
   return out;
 }
 
+/** 回應內文是否含我們剛送出的探針值。固定字串＋大小寫不敏感，避免中介層改寫大小寫就漏掉。 */
+function echoesProbeToken(body: string): boolean {
+  return body.toLowerCase().includes(TRACE_PROBE_TOKEN.toLowerCase());
+}
+
+function snippetOf(body: string): string | null {
+  return body.slice(0, SNIPPET_CHARS) || null;
+}
+
+/**
+ * 判斷一次 TRACE 探針的結果代表什麼。純函式，測試不需要網路。
+ *
+ * 順序是刻意的，而且**回吐排在所有排除規則之前**：兜底的 index.html 是建置產物、
+ * 代理的錯誤頁是罐頭字串，兩者都不可能含有我們幾毫秒前才送出去的探針值。
+ * 反過來說，只要內文出現那個值，就代表請求被原樣寫了回來——這是已經測到的高嚴重度事實，
+ * 先套排除規則會把它降級成「未判定」，等於把測到的問題講成沒測到。
+ */
+export function classifyTraceProbe(
+  input: ProbeOutcome<{ status: number; body: string; contentType: string }>,
+): TraceProbeState {
+  if ("error" in input) {
+    // 送不出去有兩種：站台連不上，或執行環境自己拒絕送（Node 的 fetch 禁用 TRACE）。
+    // 兩種都不是站台的答覆，原文照抄讓讀者自己分辨，不要替它下結論。
+    return { state: "unreachable", reason: `TRACE 送不出或連不上：${input.error}`, snippet: null };
+  }
+
+  const snippet = snippetOf(input.body);
+  if (echoesProbeToken(input.body)) {
+    return { state: "answered", status: input.status, echoed: true, snippet };
+  }
+  if (looksLikeGatewayInterception(input)) {
+    return {
+      state: "unreachable",
+      reason: `HTTP ${input.status} 且內容不像應用回應，研判為中介層（代理／WAF／平台閘道）攔截`,
+      snippet,
+    };
+  }
+  if (looksLikeSpaFallback(input.body, input.contentType)) {
+    return {
+      state: "shadowed",
+      reason: `HTTP ${input.status} 回的是 SPA 兜底頁（catch-all 接走，不代表站台處理了 TRACE）`,
+      snippet,
+    };
+  }
+  return { state: "answered", status: input.status, echoed: false, snippet };
+}
+
+/**
+ * 判斷一次 OPTIONS 探針的結果代表什麼。純函式，測試不需要網路。
+ *
+ * 帶了 Allow 就一律採信，即使狀態碼是 4xx：RFC 9110 規定回 405 時必須附上 Allow，
+ * 而中介層的罐頭錯誤頁並不知道這條路由收哪些方法，也就寫不出這個標頭。
+ * 先套中介層排除規則會把整份檢查最可靠的一次自述直接丟掉——那是白白製造漏報。
+ */
+export function classifyAllowProbe(
+  input: ProbeOutcome<{ status: number; body: string; contentType: string; allow: string | null }>,
+): AllowProbeState {
+  if ("error" in input) return { state: "unverified", reason: `OPTIONS 送不出或連不上：${input.error}` };
+
+  if (parseAllowHeader(input.allow).length > 0) {
+    return { state: "answered", allow: input.allow, note: `HTTP ${input.status}，Allow: ${input.allow}` };
+  }
+  if (looksLikeGatewayInterception(input)) {
+    return {
+      state: "unverified",
+      reason: `HTTP ${input.status} 且內容不像應用回應，研判為中介層（代理／WAF／平台閘道）攔截`,
+    };
+  }
+  // 「觀測到沒有 Allow」與「根本沒觀測到」在報告上是兩件事，facts 也必須分得開，
+  // 否則讀者會把一次失敗的探針讀成「站台沒有宣告任何方法」。
+  return { state: "answered", allow: null, note: `HTTP ${input.status}，回應沒有可解析的 Allow 標頭` };
+}
+
+/** 回應片段優先，沒有內文就退回狀態碼；兩者都沒有時寧可不附證據，也不要印出「HTTP null」。 */
+function traceEvidence(obs: MethodObservation): string | undefined {
+  if (obs.traceBodySnippet) return obs.traceBodySnippet;
+  if (obs.traceStatus !== null) return `HTTP ${obs.traceStatus}`;
+  return undefined;
+}
+
 export function analyzeMethods(
   obs: MethodObservation,
   ctx: { surface: SurfaceId; where: string; isApi: boolean },
@@ -87,9 +198,28 @@ export function analyzeMethods(
   const out: Finding[] = [];
 
   // ── TRACE ───────────────────────────────────────────────────────────────
-  // 三條判定互斥：未判定 > 回吐 > 單純可用。有回吐就只報回吐——同一件事報兩次會讓讀者
-  // 以為是兩個問題，而且較輕的那筆會稀釋掉真正要修的那筆。
-  if (obs.traceStatus === null) {
+  // 三條判定互斥：回吐 > 未判定 > 單純可用。
+  //
+  // 回吐排最前面是因為它是**唯一一條靠內文成立的判定**：看得到探針值就代表請求真的被寫了回來，
+  // 那不可能是「沒測到」。同一件事也不重複報——有回吐就不再補一筆 enabled，
+  // 否則讀者會以為是兩個問題，較輕的那筆還會稀釋掉真正要修的那筆。
+  if (obs.traceEchoesRequest) {
+    out.push(
+      finding({
+        ...base,
+        id: "methods.trace.echo",
+        severity: "high",
+        title: "TRACE 會把請求原樣回吐（Cross-Site Tracing）",
+        detail:
+          "伺服器把收到的請求標頭完整寫回回應內文。頁面上只要有一個 XSS 或可控的第三方腳本，攻擊者就能發一個 TRACE，" +
+          "再從回應裡讀出瀏覽器自動夾帶的 Cookie 與 Authorization——這些值從來沒有經過 document.cookie，" +
+          "所以 HttpOnly 完全擋不住這條路。這比「TRACE 開著」嚴重一階，因為竊取管道已經成立，不需要再等別的條件。",
+        remediation:
+          "在反向代理與應用層都明確拒絕 TRACE（回 405），兩層都要關——只擋一層的話，日後流量繞過那一層就整個失效。",
+        evidence: traceEvidence(obs),
+      }),
+    );
+  } else if (obs.traceStatus === null) {
     out.push(
       finding({
         ...base,
@@ -104,23 +234,7 @@ export function analyzeMethods(
           `想補驗就用能直送這個方法的工具跑一次（curl -X TRACE <url> -H "${TRACE_PROBE_HEADER}: ${TRACE_PROBE_TOKEN}"），` +
           "看回應內文有沒有把該標頭念回來。若 TRACE 目前是靠中介層擋掉的，仍應在來源站台上直接關閉：" +
           "中介層改設定或被繞過時，站台不該只剩那一層防護。",
-        evidence: obs.traceBodySnippet ?? undefined,
-      }),
-    );
-  } else if (obs.traceEchoesRequest) {
-    out.push(
-      finding({
-        ...base,
-        id: "methods.trace.echo",
-        severity: "high",
-        title: "TRACE 會把請求原樣回吐（Cross-Site Tracing）",
-        detail:
-          "伺服器把收到的請求標頭完整寫回回應內文。頁面上只要有一個 XSS 或可控的第三方腳本，攻擊者就能發一個 TRACE，" +
-          "再從回應裡讀出瀏覽器自動夾帶的 Cookie 與 Authorization——這些值從來沒有經過 document.cookie，" +
-          "所以 HttpOnly 完全擋不住這條路。這比「TRACE 開著」嚴重一階，因為竊取管道已經成立，不需要再等別的條件。",
-        remediation:
-          "在反向代理與應用層都明確拒絕 TRACE（回 405），兩層都要關——只擋一層的話，日後流量繞過那一層就整個失效。",
-        evidence: obs.traceBodySnippet ?? `HTTP ${obs.traceStatus}`,
+        evidence: traceEvidence(obs),
       }),
     );
   } else if (obs.traceStatus >= 200 && obs.traceStatus < 300) {
@@ -134,7 +248,7 @@ export function analyzeMethods(
           "站台接受 TRACE 並回成功。這次的回應沒有把我們送出的探針標頭念回來，所以還沒構成 Cross-Site Tracing，" +
           "但一個正常功能完全用不到的方法留在線上，等於留著一條隨時可能因為框架或中介層改版就變成可回吐的路徑。",
         remediation: "在反向代理或應用層明確拒絕 TRACE（回 405），路由只保留實際會用到的方法。",
-        evidence: obs.traceBodySnippet ?? `HTTP ${obs.traceStatus}`,
+        evidence: traceEvidence(obs),
       }),
     );
   }
@@ -191,35 +305,36 @@ export async function checkMethods(surface: Surface, timeoutMs: number): Promise
   const findings: Finding[] = [];
   const facts: Record<string, unknown> = {};
   const base = { check: "methods", category: "security" as const, surface: surface.id };
-  const observed: Record<string, { allow: string | null; trace: string }> = {};
+  const observed: Record<string, { allow: string | null; options: string; trace: string }> = {};
   const observations: MethodObservation[] = [];
   /** 至少有一次探針真的問到站台本身的路徑數。全 0＝這一輪什麼都沒驗到。 */
   let reachedApp = 0;
 
+  // 逐條路徑、逐個請求地跑，不並行：這是要拿來當基準的量測，不該自己在目標上製造尖峰流量。
   for (const path of AUDIT_PATHS) {
     const url = join(surface.origin, path);
-    let answered = false;
 
     // ── OPTIONS：只問「你收哪些方法」，本身不會改動任何東西 ──────────────
-    const options = await tryProbe(url, {
+    const optionsProbe = await tryProbe(url, {
       surface,
       timeoutMs,
       method: "OPTIONS",
       followRedirects: 0,
       maxBodyBytes: 8 * 1024,
     });
-    let allow: string | null = null;
-    if (!isProbeFailure(options)) {
-      const contentType = options.headers.get("content-type") ?? "";
-      // 代理自己回的 405／403 不代表站台的方法設定，拿來判定會把中介層的行為寫成站台的體質。
-      if (!looksLikeGatewayInterception({ status: options.status, body: options.body, contentType })) {
-        answered = true;
-        allow = options.headers.get("allow");
-      }
-    }
+    const allowState = classifyAllowProbe(
+      isProbeFailure(optionsProbe)
+        ? { error: optionsProbe.error }
+        : {
+            status: optionsProbe.status,
+            body: optionsProbe.body,
+            contentType: optionsProbe.headers.get("content-type") ?? "",
+            allow: optionsProbe.headers.get("allow"),
+          },
+    );
 
     // ── TRACE：帶固定探針標頭，回應內文出現它就是原樣回吐 ────────────────
-    const trace = await tryProbe(url, {
+    const traceProbe = await tryProbe(url, {
       surface,
       timeoutMs,
       method: "TRACE",
@@ -227,37 +342,35 @@ export async function checkMethods(surface: Surface, timeoutMs: number): Promise
       followRedirects: 0,
       maxBodyBytes: 16 * 1024,
     });
+    const traceState = classifyTraceProbe(
+      isProbeFailure(traceProbe)
+        ? { error: traceProbe.error }
+        : {
+            status: traceProbe.status,
+            body: traceProbe.body,
+            contentType: traceProbe.headers.get("content-type") ?? "",
+          },
+    );
 
-    let traceStatus: number | null = null;
-    let traceEchoesRequest = false;
-    let traceBodySnippet: string | null = null;
-    let traceNote: string;
+    // 只要其中一個探針拿到了應用層的回應，這條路徑就算真的驗過了。
+    // SPA 兜底頁雖然遮住了 TRACE 的處理方式，但它證明應用還活著，所以一樣算數。
+    if (allowState.state === "answered" || traceState.state !== "unreachable") reachedApp += 1;
 
-    if (isProbeFailure(trace)) {
-      // Node 的 fetch 依 Fetch 規範把 TRACE 列為 forbidden method，會在送出前就擋下來。
-      // 那是我們這端的限制，不是站台的行為，必須分開寫——否則讀者會以為站台拒絕了 TRACE。
-      traceNote = `未判定：${trace.error}`;
-    } else {
-      const contentType = trace.headers.get("content-type") ?? "";
-      traceBodySnippet = trace.body.slice(0, 200) || null;
-      if (looksLikeGatewayInterception({ status: trace.status, body: trace.body, contentType })) {
-        traceNote = `未判定：HTTP ${trace.status}，內容不像應用回應（研判為中介層攔截）`;
-      } else if (looksLikeSpaFallback(trace.body, contentType)) {
-        // catch-all 路由對任何方法都回 index.html。站台到底怎麼處理 TRACE 被兜底頁蓋掉了，
-        // 這是「看不到」而不是「沒問題」，照 200 判成 trace.enabled 會是整排假警報。
-        answered = true;
-        traceNote = `未判定：HTTP ${trace.status}，回的是 SPA 兜底頁（catch-all 接走，不代表站台處理了 TRACE）`;
-      } else {
-        answered = true;
-        traceStatus = trace.status;
-        traceEchoesRequest = trace.body.toLowerCase().includes(TRACE_PROBE_TOKEN);
-        traceNote = `HTTP ${trace.status}${traceEchoesRequest ? "（回吐請求標頭）" : ""}`;
-      }
-    }
-
-    if (answered) reachedApp += 1;
-    observed[path] = { allow, trace: traceNote };
-    observations.push({ path, allow, traceStatus, traceEchoesRequest, traceBodySnippet });
+    observed[path] = {
+      allow: allowState.state === "answered" ? allowState.allow : null,
+      options: allowState.state === "answered" ? allowState.note : `未觀測：${allowState.reason}`,
+      trace:
+        traceState.state === "answered"
+          ? `HTTP ${traceState.status}${traceState.echoed ? "（回吐請求標頭）" : ""}`
+          : `未判定：${traceState.reason}`,
+    };
+    observations.push({
+      path,
+      allow: allowState.state === "answered" ? allowState.allow : null,
+      traceStatus: traceState.state === "answered" ? traceState.status : null,
+      traceEchoesRequest: traceState.state === "answered" && traceState.echoed,
+      traceBodySnippet: traceState.snippet,
+    });
   }
 
   facts.observed = observed;

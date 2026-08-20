@@ -14,6 +14,11 @@
  * 這裡只解析**初始 HTML**。由 JS 動態插入的 <script>（標籤管理器、A/B 工具、
  * 依使用者條件才載入的 SDK）在這裡一律看不到——那是 pages 端頁面測試（真的開瀏覽器）的守備範圍。
  *
+ * 解析的準則只有一條：**瀏覽器真的會去載的才算**。
+ * 所以 <base> 會改變相對路徑的解析基準、內嵌腳本的內容是純文字（裡面的 "<script src=…" 只是字串）、
+ * type 不是 JS 的 <script> 是資料區塊不會被下載——這些都照瀏覽器的規則走。
+ * 偏離它的每一處，最後都會變成一筆修不掉（或不該修）的假警報。
+ *
  * 判定全寫成純函式（extractSubresources／analyzeSubresources），網路 I/O 只在 checkSupplyChain。
  */
 import { finding, stopwatch } from "../core/findings.js";
@@ -22,7 +27,7 @@ import type { CheckResult, Finding, Surface, SurfaceId } from "../core/types.js"
 
 export interface Subresource {
   kind: "script" | "stylesheet";
-  /** 解析成絕對網址後的引用（相對路徑已用頁面網址補齊）。 */
+  /** 解析成絕對網址後的引用（相對路徑已用頁面網址／<base> 補齊）。 */
   url: string;
   /** 主機名（小寫）。data:／blob: 這類非網路來源沒有主機，為 null。 */
   host: string | null;
@@ -33,6 +38,15 @@ export interface Subresource {
    * 兩者意義完全相反，混為一談會把設定正確的資源誤報成壞掉的。
    */
   crossorigin: string | null;
+  /**
+   * 是不是 `<script type="module">`。
+   *
+   * 為什麼這件事要記下來：module 腳本**一律以 CORS 模式取得**，crossorigin 屬性在它身上
+   * 只決定要不要夾帶憑證。所以「有 integrity 卻沒有 crossorigin」這條規則對 module 不成立——
+   * 照報會在報告裡寫下一句不實的話（「瀏覽器會直接拒絕載入」），而讀者只要抓到一次
+   * 說錯話的告警，就不會再相信整份報告。
+   */
+  isModule: boolean;
   isThirdParty: boolean;
   isInsecure: boolean;
 }
@@ -77,6 +91,22 @@ function looksLikeMutableScriptHost(host: string): boolean {
   return MUTABLE_SCRIPT_HOSTS.some((known) => host === known || host.endsWith(`.${known}`));
 }
 
+/** HTML 規格認定為「JavaScript」的 MIME 型別（含一票歷史寫法，實務上還看得到）。 */
+const JS_MIME =
+  /^(?:text\/(?:javascript\d*|ecmascript|jscript|livescript|x-javascript|x-ecmascript)|application\/(?:javascript|ecmascript|x-javascript|x-ecmascript))$/;
+
+/**
+ * 這個 `<script>` 的 type 會讓瀏覽器真的去下載並執行嗎？
+ *
+ * 沒有 type 或 type 是 JS／module 才會；其餘（application/ld+json、text/template、
+ * importmap⋯⋯）是**資料區塊**，瀏覽器連請求都不會送。把資料區塊算成子資源，
+ * 會產生一筆「請幫這個第三方腳本加上 SRI」的告警，而那支腳本根本沒有被載入過。
+ */
+function isExecutableScriptType(rawType: string | undefined): boolean {
+  const type = (rawType ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+  return type === "" || type === "module" || JS_MIME.test(type);
+}
+
 /**
  * 找出開始標籤的結尾 `>`，掃描時尊重引號。
  *
@@ -97,6 +127,13 @@ function findTagEnd(html: string, from: number): number {
     else if (ch === ">") return i;
   }
   return -1;
+}
+
+/** `</script` 的位置（找不到回 -1）。內嵌腳本的內容到這裡為止都是純文字。 */
+function findScriptTextEnd(html: string, from: number): number {
+  const closing = /<\/script(?=[\s/>])/gi;
+  closing.lastIndex = from;
+  return closing.exec(html)?.index ?? -1;
 }
 
 /**
@@ -124,10 +161,17 @@ function decodeAttrValue(raw: string): string {
   return raw.replace(/&amp;/gi, "&");
 }
 
+/**
+ * 把一個引用轉成 Subresource。
+ *
+ * `base` 是相對路徑的解析基準（可能被 <base> 改掉），`page` 永遠是頁面本身的網址——
+ * 同源與否要跟**頁面的來源**比，那件事不會因為 <base> 而改變。
+ */
 function toSubresource(
   kind: Subresource["kind"],
   rawUrl: string,
   attrs: Map<string, string>,
+  base: URL,
   page: URL,
 ): Subresource | null {
   const trimmed = decodeAttrValue(rawUrl).trim();
@@ -135,7 +179,7 @@ function toSubresource(
 
   let resolved: URL;
   try {
-    resolved = new URL(trimmed, page);
+    resolved = new URL(trimmed, base);
   } catch {
     return null; // 解析不出來的引用（樣板變數沒被取代之類）不猜，也不讓檢查器崩掉
   }
@@ -151,11 +195,17 @@ function toSubresource(
     host,
     integrity: integrity === "" ? null : integrity,
     crossorigin: attrs.get("crossorigin") ?? null,
+    isModule: kind === "script" && (attrs.get("type") ?? "").trim().toLowerCase() === "module",
     // 子網域也算第三方：cdn.example.com 指向誰、由誰控制，跟主網域是兩件事，
     // 而「自家網域 CNAME 到外部服務」正是這類供應鏈事故最常見的形狀。
     isThirdParty: host !== null && host !== page.hostname.toLowerCase(),
     isInsecure: resolved.protocol === "http:" && !LOOPBACK.test(host ?? ""),
   };
+}
+
+/** 同一份引用（欄位完全相同）在 HTML 裡重複出現時的識別鍵。 */
+function subresourceKey(r: Subresource): string {
+  return [r.kind, r.url, r.integrity ?? "", r.crossorigin ?? "", r.isModule].join("\n");
 }
 
 /**
@@ -177,33 +227,81 @@ export function extractSubresources(html: string, pageUrl: string): Subresource[
   const source = html.replace(/<!--[\s\S]*?-->/g, "");
 
   const out: Subresource[] = [];
-  const opener = /<(script|link)(?=[\s/>])/gi;
+  const seen = new Set<string>();
+  /**
+   * 收下一筆引用；完全相同的重複只留一次。
+   *
+   * 瀏覽器對同一個網址只會取一次，把重複的標記算成兩支，會讓「腳本 2」與
+   *「N 個子資源以 http 載入」這種數字虛胖。只折疊每個欄位都一樣的重複——
+   * 屬性有差異（一處有 integrity、一處沒有）是真的兩種寫法，兩筆都得留著。
+   */
+  const collect = (item: Subresource | null): void => {
+    if (item === null) return;
+    const key = subresourceKey(item);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(item);
+  };
+  const opener = /<(script|link|base)(?=[\s/>])/gi;
 
-  for (const match of source.matchAll(opener)) {
+  // 相對路徑的解析基準。<base href> 之前的引用仍以頁面網址解析（瀏覽器是邊解析邊發請求的），
+  // 而且依規格只有**第一個**帶 href 的 <base> 生效。
+  let resolveBase = page;
+  let baseLocked = false;
+  // 文件裡已經沒有 </script> 了。掃描位置只會往前走，所以一旦找不到收尾，後面也不可能再有——
+  // 不記下來的話，一份塞滿 <script src=x> 卻沒有任何收尾的頁面會讓每個標籤都往文件尾掃一遍
+  // （實測 2 萬個標籤要 3.7 秒）。受測站不該有能力拖住掃描自己的工具。
+  let noMoreScriptEnd = false;
+
+  let match: RegExpExecArray | null = opener.exec(source);
+  while (match !== null) {
     const tag = match[1]?.toLowerCase();
-    if (tag === undefined || match.index === undefined) continue;
-
     const attrStart = match.index + match[0].length;
     const tagEnd = findTagEnd(source, attrStart);
-    if (tagEnd < 0) continue; // 標籤沒有收尾（HTML 被截斷）就不猜
+    if (tagEnd < 0) {
+      // 標籤沒有收尾（HTML 被截斷或引號沒配對）就不猜這一個，但後面照掃：
+      // 為了一段壞掉的標記而放棄整份文件，換來的是一張看起來很乾淨的空清單。
+      match = opener.exec(source);
+      continue;
+    }
+    // 屬性值裡的字串（`src="x?q=<link"`）不該被當成下一個標籤，所以掃描直接跳到標籤結尾之後。
+    opener.lastIndex = tagEnd + 1;
 
     const attrs = parseAttributes(source.slice(attrStart, tagEnd));
 
-    if (tag === "script") {
+    if (tag === "base") {
+      const href = attrs.get("href");
+      if (!baseLocked && href !== undefined && href.trim() !== "") {
+        try {
+          resolveBase = new URL(decodeAttrValue(href).trim(), page);
+          baseLocked = true;
+        } catch {
+          // 壞掉的 base 沿用頁面網址，跟瀏覽器一樣
+        }
+      }
+    } else if (tag === "script") {
       const src = attrs.get("src");
-      if (src === undefined) continue; // 內嵌腳本沒有第三方可盤點
-      const item = toSubresource("script", src, attrs, page);
-      if (item) out.push(item);
-      continue;
+      // 內嵌腳本的內容是純文字：裡面出現的 "<script src=…"、'<link rel=stylesheet…'
+      // 只是字串（document.write 的老式廣告碼、樣板字串都會長這樣），
+      // 不跳過就會把它們盤點成真的第三方資源——一筆查不到出處、也修不掉的假警報。
+      const textEnd = noMoreScriptEnd ? -1 : findScriptTextEnd(source, tagEnd + 1);
+      if (textEnd >= 0) opener.lastIndex = textEnd;
+      else noMoreScriptEnd = true;
+
+      // type 不是 JS 的 <script> 是資料區塊，瀏覽器根本不會去下載 src。
+      if (src !== undefined && isExecutableScriptType(attrs.get("type"))) {
+        collect(toSubresource("script", src, attrs, resolveBase, page));
+      }
+    } else {
+      // <link> 只有 stylesheet 會被套用；preload／icon／manifest 不在這次盤點的範圍。
+      const rel = (attrs.get("rel") ?? "").toLowerCase().split(/\s+/);
+      const href = attrs.get("href");
+      if (rel.includes("stylesheet") && href !== undefined) {
+        collect(toSubresource("stylesheet", href, attrs, resolveBase, page));
+      }
     }
 
-    // <link> 只有 stylesheet 會被套用；preload／icon／manifest 不在這次盤點的範圍。
-    const rel = (attrs.get("rel") ?? "").toLowerCase().split(/\s+/);
-    if (!rel.includes("stylesheet")) continue;
-    const href = attrs.get("href");
-    if (href === undefined) continue;
-    const item = toSubresource("stylesheet", href, attrs, page);
-    if (item) out.push(item);
+    match = opener.exec(source);
   }
 
   return out;
@@ -285,7 +383,9 @@ export function analyzeSubresources(
   // 同源子資源刻意不報：那是自家部署的產物，威脅模型裡沒有「自己竄改自己」這一項，
   // 硬要上 SRI 只會讓每次發版都得同步更新雜湊，換來的是零風險降低。
   const thirdParty = resources.filter((r) => r.isThirdParty);
-  const hosts = [...new Set(thirdParty.map((r) => r.host as string))].sort((a, b) =>
+  // 用 flatMap 收斂而不是 `r.host as string`：型別斷言會讓一筆 host 為 null 的異常輸入
+  // 變成 `supply-chain.script-no-sri.null` 這種假 id，而 id 是抑制清單與跨次比對的鍵。
+  const hosts = [...new Set(thirdParty.flatMap((r) => (r.host === null ? [] : [r.host])))].sort((a, b) =>
     a < b ? -1 : a > b ? 1 : 0,
   );
 
@@ -295,7 +395,8 @@ export function analyzeSubresources(
     const stylesNoSri = owned.filter((r) => r.kind === "stylesheet" && r.integrity === null);
     // 跨來源資源要通過 SRI 驗證必須以 CORS 模式取得，所以這條只對第三方成立；
     // 同源資源沒有 crossorigin 也驗得起來，拿去報會是純噪音。
-    const sriNoCors = owned.filter((r) => r.integrity !== null && r.crossorigin === null);
+    // module 也排除：它本來就走 CORS，缺 crossorigin 不會被拒載（見 Subresource.isModule）。
+    const sriNoCors = owned.filter((r) => r.integrity !== null && r.crossorigin === null && !r.isModule);
 
     if (scriptsNoSri.length > 0) {
       const mutableNote = looksLikeMutableScriptHost(host)
@@ -406,6 +507,7 @@ export async function checkSupplyChain(surface: Surface, timeoutMs: number): Pro
   facts.status = res.status;
   facts.contentType = contentType || null;
   facts.finalUrl = res.url;
+  facts.truncated = res.truncated;
 
   // 中介層（代理／WAF／平台閘道）的裸回應上當然一支第三方腳本都沒有。
   // 照樣分析會產出一份「乾淨」的盤點，那比沒有盤點更糟——它會讓人以為查過了。
@@ -416,6 +518,29 @@ export async function checkSupplyChain(surface: Surface, timeoutMs: number): Pro
       skippedReason:
         `首頁回應 HTTP ${res.status} 且內容不像應用回應，判定為中介層攔截。` +
         "子資源盤點已略過——中介層的頁面不是站台的頁面。請從能直連目標的網路環境重跑。",
+      durationMs: elapsed(),
+      findings,
+      facts,
+    };
+  }
+
+  // 只有 2xx 才代表「首頁真的把內容給我們了」。
+  //
+  // 3xx：跟隨上限用完仍在導向，手上這份是中繼回應（常常還帶著 text/html 的一行導向頁）。
+  // 4xx／5xx：拿到的是錯誤頁或整站的登入牆——SPA 的錯誤頁還會長得跟首頁一模一樣，
+  // 所以 looksLikeGatewayInterception 不會攔下它。
+  // 兩種情況照樣解析都會得到一份幾乎空的清單，再以 completed: true 送出去，
+  // 讀者看到的是「這個站沒有第三方資源」，而事實是我們根本沒讀到首頁。
+  if (res.status < 200 || res.status >= 300) {
+    const isRedirect = res.status >= 300 && res.status < 400;
+    return {
+      ...base,
+      completed: false,
+      skippedReason:
+        `首頁回應 HTTP ${res.status}（最後停在 ${res.url}），拿到的不是首頁內容，因此沒有盤點。` +
+        (isRedirect
+          ? `已跟隨 ${res.redirects.length} 次重導向仍未落地，請確認首頁的導向設定是否成環或過長。`
+          : "站台可能正在故障，或整站需要登入才看得到首頁；請在首頁能正常取得時重跑。"),
       durationMs: elapsed(),
       findings,
       facts,
@@ -436,7 +561,6 @@ export async function checkSupplyChain(surface: Surface, timeoutMs: number): Pro
   // HTML 被讀取上限截斷時，後半段的 <script> 全都看不到。
   // 這種情況下的盤點必然不完整，而一份不完整卻被當成完整的清單，正是這套系統最該避免的產物。
   if (res.truncated) {
-    facts.truncated = true;
     return {
       ...base,
       completed: false,

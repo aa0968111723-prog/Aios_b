@@ -1,13 +1,29 @@
-import { describe, expect, it } from "vitest";
+/**
+ * well-known 檔案檢測的測試。
+ *
+ * 這一項的價值幾乎全在「判對了沒有」，而它有三種失效方向，各自都有測試盯著：
+ *
+ * - 假警報：SPA 對 `/robots.txt` 回 200 index.html，被讀成「有一份內容很奇怪的 robots.txt」；
+ *   或一頁純文字錯誤頁被讀成「有 security.txt 但缺 Contact」。維運者會照著這種結論
+ *   去找一個不存在的檔案。
+ * - 假綠燈：兩份檔案都沒取到，卻回 completed: true 加零發現——讀者會理解成「都查過了」。
+ * - 判定漂移：Expires 沒帶時區時 `new Date` 以當地時間解讀，同一份檔案在不同時區的 CI 上
+ *   會得到不同的過期結論。判定只能取決於被測的站台。
+ *
+ * 所有案例都離線：純函式直接餵字串，IO 進入點餵假 fetch，不發出任何真實請求。
+ */
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   analyzeRobots,
   analyzeSecurityTxt,
+  checkWellKnown,
   classifyWellKnownFile,
   findSensitiveDisallows,
   looksLikeSpaFallback,
   parseRobots,
   parseSecurityTxt,
 } from "../src/detectors/wellknown.js";
+import { buildSurfaces } from "../src/core/surfaces.js";
 
 const robotsCtx = { surface: "web" as const, where: "https://example.test/robots.txt" };
 const securityCtx = {

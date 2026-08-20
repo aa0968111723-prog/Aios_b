@@ -35,8 +35,14 @@ const MIN_RSA_BITS = 2048;
  * 憑證上沒有直接寫「這把公鑰是什麼演算法」，只能從簽章演算法推測，而簽章演算法屬於**簽發者**的
  * 金鑰——RSA 的中介 CA 簽一張 ECDSA 葉憑證是完全合法的組合。所以只要位元數落在這些曲線長度上，
  * 就當作判斷不了而不報。
+ *
+ * **512 刻意不在這張表裡**，即使 brainpoolP512r1 確實是 512 bits。這是一個要選邊站的撞號：
+ * 512 同時也是 RSA 的長度，而 512 bits 的 RSA 是現實中最危險的一種金鑰——分解它是幾小時的事，
+ * 私鑰一被還原，任何人都能完整冒充本站。相對地，brainpool 系列從來不在公開 CA 的簽發清單上，
+ * 主流瀏覽器（Chrome／Firefox／Safari）在 TLS 交握也不接受它，真的用了那條曲線的站台
+ * 本來就沒有人連得進去。兩種誤判都極罕見，但代價差了好幾個數量級，所以這裡選擇寧可報。
  */
-const EC_KEY_BITS = new Set([192, 224, 233, 239, 256, 283, 320, 384, 409, 512, 521, 571]);
+const EC_KEY_BITS = new Set([192, 224, 233, 239, 256, 283, 320, 384, 409, 521, 571]);
 
 /**
  * 從憑證取得的原始事實。
@@ -157,11 +163,60 @@ const SIGNATURE_OIDS: ReadonlyArray<readonly [string, string]> = [
   ["06032b6571", "Ed448"],
 ];
 
-export function signatureAlgorithmFromDer(der: Uint8Array): string | null {
-  const hex = Array.from(der, (b) => b.toString(16).padStart(2, "0")).join("");
-  for (const [pattern, name] of SIGNATURE_OIDS) {
-    if (hex.includes(pattern)) return name;
+/** 十六進位樣板轉位元組。只在模組載入時跑一次，比對時就不必再碰字串。 */
+function hexToBytes(hex: string): number[] {
+  const out: number[] = [];
+  for (let i = 0; i + 1 < hex.length; i += 2) out.push(Number.parseInt(hex.slice(i, i + 2), 16));
+  return out;
+}
+
+const SIGNATURE_OID_BYTES: ReadonlyArray<readonly [number[], string]> = SIGNATURE_OIDS.map(
+  ([hex, name]) => [hexToBytes(hex), name] as const,
+);
+
+/** 位元組層級的子序列搜尋。 */
+function includesBytes(haystack: Uint8Array, needle: readonly number[]): boolean {
+  const last = haystack.length - needle.length;
+  for (let i = 0; i <= last; i += 1) {
+    let hit = true;
+    for (let j = 0; j < needle.length; j += 1) {
+      if (haystack[i + j] !== needle[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) return true;
   }
+  return false;
+}
+
+export function signatureAlgorithmFromDer(der: Uint8Array): string | null {
+  // 比對走位元組而不是十六進位字串。
+  //
+  // 把整段 DER 轉成 hex 再 `includes` 會少掉「位元組邊界」這個條件：樣板可以從**半個位元組**
+  // 的位置命中，於是公鑰模數那幾百個亂數位元組裡任何一段巧合，都可能被讀成一個簽章演算法 OID。
+  // 機率很低，但一旦發生，產出的是一筆 high 等級的「憑證簽章使用已破解的雜湊」——
+  // 對一張其實好好的憑證。降噪的規則同樣適用於這裡：判定的前提本身不能有機率性的雜訊。
+  for (const [bytes, name] of SIGNATURE_OID_BYTES) {
+    if (includesBytes(der, bytes)) return name;
+  }
+  return null;
+}
+
+/**
+ * 有沒有東西擋住了「還剩幾天到期」這個問題。
+ *
+ * 這一項檢查存在的全部理由就是回答那個數字。效期字串讀不出來時，`analyzeCertificate` 會
+ * 安靜地跳過所有效期判定——那是對的（用 NaN 去比大小只會亂報），但呼叫端若照樣回
+ * `completed: true`，報告上就會出現一個綠勾，讀者理所當然地以為憑證被檢查過了。
+ * 「沒測到」被講成「沒問題」，正是這種系統最嚴重的失效方式，所以判斷「這一輪到底算不算測過」
+ * 也是一條判定規則，要留在純函式這一側、要能離線測。
+ *
+ * 回傳的是原因字串（給人看的，含實際觀測到的值），沒有問題時回 null。
+ */
+export function expiryCheckBlocker(info: CertificateInfo): string | null {
+  if (!info.validTo.trim()) return "憑證沒有帶到期時間（valid_to 是空的）";
+  if (!parseCertificateDate(info.validTo)) return `到期時間「${info.validTo}」無法解析成日期`;
   return null;
 }
 
@@ -196,7 +251,12 @@ export function analyzeCertificate(info: CertificateInfo, ctx: CertificateContex
             "三端共用同一張憑證，所以不會有任何一端還能用。使用者看到的是安全警告，不是 Aios。",
           remediation:
             "立刻簽發並佈署新憑證，然後回頭查為什麼自動續期沒有生效（ACME 續期失敗、平台代管憑證未綁上網域、或憑證根本是手動上傳的）。",
-          evidence: `${identity}\nvalidTo: ${info.validTo}（已過期 ${Math.abs(Math.floor(daysLeft))} 天）`,
+          // 取整必須往「已經過了多久」的方向講，而且不足一天要明講。
+          // 舊寫法用 Math.abs(Math.floor(-0.2)) 會把「兩小時前剛過期」印成「已過期 1 天」——
+          // 證據欄一旦說了與事實不符的數字，讀者連帶不會相信旁邊那句判定。
+          evidence:
+            `${identity}\nvalidTo: ${info.validTo}` +
+            `（${daysLeft > -1 ? "距今不到 1 天" : `距今 ${Math.floor(-daysLeft)} 天`}）`,
         }),
       );
     } else if (daysLeft < EXPIRY_NOTICE_DAYS) {
@@ -213,7 +273,8 @@ export function analyzeCertificate(info: CertificateInfo, ctx: CertificateContex
           ...base,
           id: "tls.cert.expiring",
           severity,
-          title: `憑證將在 ${Math.floor(daysLeft)} 天後到期`,
+          // 剩不到一天時直接寫「0 天後到期」會把最緊急的那一格講成最難懂的一句話。
+          title: daysLeft < 1 ? "憑證將在不到 1 天內到期" : `憑證將在 ${Math.floor(daysLeft)} 天後到期`,
           detail,
           remediation:
             "確認自動續期（ACME／平台代管憑證）確實執行成功，而不是只確認「有設定」；並在到期前 30 天設一個會吵人的提醒，別依賴這份報告有人讀。",
@@ -452,8 +513,13 @@ function readCertificate(options: { host: string; port: number; timeoutMs: numbe
       });
     });
 
-    socket.once("error", (err: Error) => finish({ error: err.message }));
-    socket.once("close", () => finish({ error: "連線在 TLS 交握完成前被關閉" }));
+    // 用 on 而不是 once：once 在第一次事件後就把監聽器拿掉，socket 若再吐一次 'error'
+    // （交握失敗後緊接著 ECONNRESET、或 destroy 過程中的殘餘錯誤），那個事件就沒有接收者了。
+    // EventEmitter 對無人接收的 'error' 的處理方式是直接拋——那是事件迴圈上的例外，
+    // runner 的 safely 只包得住 Promise，包不住它，結果是整輪掃描連同已經測完的項目一起沒了。
+    // 留著監聽器、由 settled 擋掉重複結算，是這裡唯一安全的寫法。
+    socket.on("error", (err: Error) => finish({ error: err.message }));
+    socket.on("close", () => finish({ error: "連線在 TLS 交握完成前被關閉" }));
   });
 }
 
@@ -529,6 +595,22 @@ export async function checkTls(surface: Surface, timeoutMs: number): Promise<Che
     protocol: info.protocol,
     cipher: info.cipher,
   };
+
+  // 憑證撈到了，但效期讀不出來——這一項最該回答的問題沒有答案，所以不能算完成。
+  // 已經判定出來的其他發現照樣留著：它們是真的觀測，跳過的只是「還剩幾天」那一格。
+  const blocker = expiryCheckBlocker(info);
+  if (blocker) {
+    return {
+      ...base,
+      completed: false,
+      skippedReason:
+        `已與 ${host}:${port} 完成交握並取得憑證，但${blocker}，因此「憑證還剩幾天到期」這一項沒有結論。` +
+        "請直接以 `openssl s_client -connect 主機:443 | openssl x509 -noout -dates` 人工確認到期日。",
+      durationMs: elapsed(),
+      findings,
+      facts,
+    };
+  }
 
   return { ...base, completed: true, durationMs: elapsed(), findings, facts };
 }

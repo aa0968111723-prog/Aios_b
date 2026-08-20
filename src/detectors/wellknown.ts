@@ -55,23 +55,28 @@ export const SENSITIVE_ROBOTS_KEYWORDS: readonly string[] = [
 ];
 
 /**
- * 關鍵字比對用的樣式。
+ * 關鍵字比對用的樣式，模組載入時就編好。
  *
  * 前後都要求非字母邊界，是為了不讓 `dev` 咬到 `/devices`、`config` 咬到 `/configurator`；
  * 只額外放行一個結尾的 `s`，因為 `/api-keys`、`/backups` 這種複數寫法太常見，漏掉它們
  * 等於這條規則在真實站台上大半時間不會動。
+ *
+ * 樣式先編好而不是每次比對現編：這個函式對每條路徑都要掃過整份關鍵字清單，
+ * 現編等於每條路徑都重建十幾個 RegExp，而它們的內容從頭到尾都一樣。
  */
-function keywordPattern(keyword: string): RegExp {
-  const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![a-z0-9])${escaped}s?(?![a-z])`, "i");
-}
+const SENSITIVE_ROBOTS_PATTERNS: ReadonlyArray<{ keyword: string; pattern: RegExp }> = SENSITIVE_ROBOTS_KEYWORDS.map(
+  (keyword) => ({
+    keyword,
+    pattern: new RegExp(`(?<![a-z0-9])${keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}s?(?![a-z])`, "i"),
+  }),
+);
 
 /** 找出 Disallow 清單裡看起來敏感的路徑；一條路徑只回報第一個命中的關鍵字。 */
 export function findSensitiveDisallows(paths: string[]): Array<{ path: string; keyword: string }> {
   const hits: Array<{ path: string; keyword: string }> = [];
   for (const path of paths) {
-    for (const keyword of SENSITIVE_ROBOTS_KEYWORDS) {
-      if (!keywordPattern(keyword).test(path)) continue;
+    for (const { keyword, pattern } of SENSITIVE_ROBOTS_PATTERNS) {
+      if (!pattern.test(path)) continue;
       hits.push({ path, keyword });
       break;
     }
@@ -225,6 +230,27 @@ export interface SecurityTxtAnalysis {
 }
 
 /**
+ * RFC 9116 定義的欄位名（一律小寫）。
+ *
+ * 用途是判定「這份回應到底是不是一份 security.txt」，理由與 `parseRobots` 的 `present`
+ * 同源：`Field: value` 是一個太容易誤中的形狀。一頁純文字的錯誤頁只要寫著
+ * `Error: not found`，就會被解析成「一份有欄位、但缺 Contact 的 security.txt」，
+ * 於是報告上出現 `no-contact`（有檔案但寫壞了）而不是 `missing`（根本沒有這份檔案）——
+ * 兩者的修法完全不同，維運者會照著錯的那個去找一個不存在的檔案。
+ */
+const SECURITY_TXT_FIELDS: ReadonlySet<string> = new Set([
+  "acknowledgments",
+  "canonical",
+  "contact",
+  "csaf",
+  "encryption",
+  "expires",
+  "hiring",
+  "policy",
+  "preferred-languages",
+]);
+
+/**
  * 解析 security.txt（RFC 9116 的 `Field: value` 格式）。
  *
  * 欄位名大小寫不敏感，同名欄位可重複——`Contact` 寫三行是規格鼓勵的做法（依偏好排序），
@@ -234,6 +260,10 @@ export interface SecurityTxtAnalysis {
  * `-----BEGIN PGP SIGNED MESSAGE-----` 與 armor 標頭（`Hash: SHA256`）。不剝掉的話，
  * 那個 `Hash:` 會被當成一個正常欄位混進 fields，簽章區塊裡的 `Version:` 也一樣——
  * 判定不會出錯，但報告上會出現站台根本沒寫的欄位，讀者會開始懷疑其他數字。
+ *
+ * `present` 只認 RFC 9116 定義過的欄位（fields 仍然把看到的都記下來，證據要完整）。
+ * 這同時是 SPA 兜底的第二層保險：就算哪天兜底判定失手，一份 index.html 也湊不出
+ * 一個合規欄位名，於是結論仍然是「沒有這份檔案」，而不是「有一份寫壞的檔案」。
  */
 export function parseSecurityTxt(body: string): SecurityTxtAnalysis {
   let text = body;
@@ -247,7 +277,11 @@ export function parseSecurityTxt(body: string): SecurityTxtAnalysis {
   const signatureAt = text.indexOf("-----BEGIN PGP SIGNATURE-----");
   if (signatureAt !== -1) text = text.slice(0, signatureAt);
 
-  const fields: Record<string, string[]> = {};
+  // 用 Map 蒐集而不是直接往物件上塞：欄位名整個來自遠端回應，而 `Constructor: x` 這一行
+  // 會讓 `fields["constructor"]` 讀到 Object.prototype 上的建構子（不是 undefined），
+  // `??=` 於是不補陣列，下一步的 `.push` 直接丟 TypeError。一行畸形（或刻意寫壞）的回應
+  // 就足以讓整項檢查從「有結論」變成「檢測器自己爆掉」。
+  const collected = new Map<string, string[]>();
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
@@ -257,16 +291,36 @@ export function parseSecurityTxt(body: string): SecurityTxtAnalysis {
     const name = match?.[1]?.toLowerCase();
     const value = match?.[2]?.trim();
     if (!name || !value) continue;
-    (fields[name] ??= []).push(value);
+    const existing = collected.get(name);
+    if (existing) existing.push(value);
+    else collected.set(name, [value]);
   }
 
-  return { present: Object.keys(fields).length > 0, fields, expires: fields.expires?.[0] ?? null };
+  const present = [...collected.keys()].some((name) => SECURITY_TXT_FIELDS.has(name));
+  return { present, fields: Object.fromEntries(collected), expires: collected.get("expires")?.[0] ?? null };
 }
+
+/**
+ * RFC 3339 的日期時間；帶時間就必須帶時區位移（`Z` 或 `+08:00`）。
+ *
+ * 不能直接把值丟給 `new Date`：那個建構子會吃下 `2027`、`Jan 2027`、`Fri, 01 Jan 2027`
+ * 這些不合規的寫法並回一個看起來很正常的日期，於是一份通報方工具讀不動的 Expires，
+ * 在我們的報告上顯示「還沒過期，沒問題」——最不該出現的那種假綠燈。
+ *
+ * 沒有時區的 `2027-01-01T00:00:00` 也一併拒收，理由更硬：`new Date` 會把它當成
+ * **執行機器的當地時間**，同一份檔案在不同時區的 CI 上會得到不同的過期結論。
+ * 判定必須只取決於被測的站台，不能取決於誰在哪裡跑這支工具。
+ * 純日期 `2027-01-01` 則放行——JS 規範明定它以 UTC 解讀，不會漂移。
+ */
+const RFC3339_EXPIRES = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2}))?$/i;
 
 /** Expires 轉 Date；格式不合回 null——寧可說「判不出來」，也不要拿 NaN 去比大小。 */
 function parseExpiresDate(value: string | null): Date | null {
   if (!value) return null;
-  const date = new Date(value.trim());
+  const text = value.trim();
+  if (!RFC3339_EXPIRES.test(text)) return null;
+  // 樣式過了不代表日期存在（`2027-02-30`），仍要看 Date 認不認。
+  const date = new Date(text.replace(" ", "T"));
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
@@ -344,9 +398,12 @@ export function analyzeSecurityTxt(
         title: "security.txt 缺少可用的 Expires 欄位",
         detail:
           "Expires 是 RFC 9116 的必填欄位，用途是讓讀到這份檔案的人知道裡面的資訊還算不算數。" +
-          "缺少它（或值不是 RFC 3339 格式而解析不出來）時，通報者無從判斷這份聯絡資訊是上個月還是五年前留下的。" +
+          "缺少它（或值不是 RFC 3339 格式、沒帶時區而解析不出來）時，通報者無從判斷這份聯絡資訊是上個月還是五年前留下的，" +
+          "而且對方的自動化工具通常會直接把這份檔案當成過期處理。" +
           "這本身不是資安缺陷，所以只記錄、不升級。",
-        remediation: "加上 `Expires: 2027-01-01T00:00:00Z` 這類 RFC 3339 時間，並在到期前更新。",
+        remediation:
+          "加上 `Expires: 2027-01-01T00:00:00Z` 這類 RFC 3339 時間（一定要帶 `Z` 或 `+08:00` 這樣的時區，" +
+          "否則同一個值在不同時區會被讀成不同時刻），並在到期前更新。",
         evidence: analysis.expires ? `Expires: ${analysis.expires}（無法解析為時間）` : `目前的欄位：${fieldNames}`,
       }),
     );

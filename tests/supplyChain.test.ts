@@ -1,14 +1,32 @@
-import { describe, expect, it } from "vitest";
+/**
+ * 前端供應鏈檢測的測試。
+ *
+ * 三個焦點，各對應一種這個偵測器會出現的失效方向：
+ *
+ * - **假警報**：解析必須跟著瀏覽器的規則走。內嵌腳本裡的字串、註解掉的舊 CDN、
+ *   type 不是 JS 的資料區塊——這些瀏覽器都不會去載，報出來就是要人去修一個不存在的問題。
+ *   同源資源不報 SRI 也屬於這一類：那是自家部署，硬加只有發版負擔。
+ * - **說錯話**：module 腳本本來就走 CORS，缺 crossorigin 不會被拒載。
+ *   對它報「瀏覽器會直接拒絕載入」是在報告裡寫下一句不實的話，而讀者抓到一次就不會再相信整份報告。
+ * - **假綠燈**：讀不到首頁（連不上、被中介層攔截、非 HTML、錯誤頁、重導向沒收斂、內容被截斷）時，
+ *   盤點結果必然是空的。那種空清單一旦以 completed: true 送出去，讀起來就是「這個站沒有第三方資源」。
+ *
+ * 需要 I/O 的部分一律用注入的 fetch 假件驅動，不發出任何真實網路請求。
+ */
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   analyzeSubresources,
+  checkSupplyChain,
   extractSubresources,
   inventoryByHost,
   type Subresource,
 } from "../src/detectors/supplyChain.js";
+import { buildSurfaces } from "../src/core/surfaces.js";
 
 const PAGE = "https://app.aios.test/";
 const ctx = { surface: "web" as const, where: PAGE, https: true };
-const ids = (findings: ReturnType<typeof analyzeSubresources>) => findings.map((f) => f.id);
+const ids = (findings: Array<{ id: string }>) => findings.map((f) => f.id);
+const web = buildSurfaces("https://app.aios.test")[0]!;
 
 /** 測試用的子資源建構子：只寫出這一筆要驗的欄位，其餘取安全預設。 */
 function res(partial: Partial<Subresource> & Pick<Subresource, "kind" | "url">): Subresource {
@@ -23,11 +41,16 @@ function res(partial: Partial<Subresource> & Pick<Subresource, "kind" | "url">):
     host,
     integrity: null,
     crossorigin: null,
+    isModule: false,
     isThirdParty: host !== null && host !== "app.aios.test",
     isInsecure: partial.url.startsWith("http://"),
     ...partial,
   };
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("extractSubresources", () => {
   it("抓出外部腳本與樣式表，內嵌 script 不算子資源", () => {
@@ -110,6 +133,83 @@ describe("extractSubresources", () => {
     expect(found.map((r) => r.host)).toEqual(["cdn.example.test"]);
   });
 
+  it("內嵌腳本的內容是純文字，裡面長得像標籤的字串不算子資源", () => {
+    // 老式的廣告／聊天外掛就是用 document.write 拼字串把腳本插進來的。
+    // 不把 <script>…</script> 之間當成純文字跳過，這裡會盤點出一個查不到出處、也修不掉的第三方。
+    const html = `
+      <script>
+        var tag = '<script src="https://phantom.example.test/x.js"><\\/script>';
+        var css = '<link rel="stylesheet" href="https://phantom.example.test/x.css">';
+      </script>
+      <script src="https://cdn.example.test/real.js"></script>
+    `;
+    const found = extractSubresources(html, PAGE);
+    expect(found.map((r) => r.url)).toEqual(["https://cdn.example.test/real.js"]);
+  });
+
+  it("<base href> 會改變相對路徑的解析基準，但同源判定仍以頁面來源為準", () => {
+    // 資產搬到自家 CDN 時常見的寫法。忽略 <base> 的話，那些檔案會被算成第一方，
+    // 於是整份第三方盤點靜靜地變成空的——沒有任何一條告警，讀起來像是站台很乾淨。
+    const html = `
+      <base href="https://static.aios.test/build/">
+      <script src="app.js"></script>
+      <link rel="stylesheet" href="app.css">
+    `;
+    const found = extractSubresources(html, PAGE);
+    expect(found.map((r) => r.url)).toEqual([
+      "https://static.aios.test/build/app.js",
+      "https://static.aios.test/build/app.css",
+    ]);
+    expect(found.every((r) => r.isThirdParty)).toBe(true);
+  });
+
+  it("只有第一個 base 生效，寫在 base 之前的引用不受影響（瀏覽器是邊解析邊發請求的）", () => {
+    const html = `
+      <script src="/early.js"></script>
+      <base href="https://static.aios.test/build/">
+      <script src="late.js"></script>
+      <base href="https://ignored.example.test/">
+      <script src="later.js"></script>
+    `;
+    const found = extractSubresources(html, PAGE);
+    expect(found.map((r) => r.url)).toEqual([
+      "https://app.aios.test/early.js",
+      "https://static.aios.test/build/late.js",
+      "https://static.aios.test/build/later.js",
+    ]);
+  });
+
+  it("type 不是 JavaScript 的 script 是資料區塊，瀏覽器不會下載它", () => {
+    const html = `
+      <script type="application/ld+json" src="https://cdn.example.test/data.json"></script>
+      <script type="text/template" src="https://cdn.example.test/tpl.html"></script>
+      <script type="text/javascript" src="https://cdn.example.test/classic.js"></script>
+      <script type="module" src="https://cdn.example.test/esm.js"></script>
+    `;
+    const found = extractSubresources(html, PAGE);
+    expect(found.map((r) => r.url)).toEqual([
+      "https://cdn.example.test/classic.js",
+      "https://cdn.example.test/esm.js",
+    ]);
+    expect(found.map((r) => r.isModule)).toEqual([false, true]);
+  });
+
+  it("完全相同的重複引用只算一次，屬性有差異的則兩筆都留", () => {
+    // 瀏覽器對同一個網址只會取一次；算成兩支會讓盤點數字與「N 個子資源」的標題虛胖。
+    const html = `
+      <script src="https://cdn.example.test/a.js"></script>
+      <script src="https://cdn.example.test/a.js"></script>
+      <script src="https://cdn.example.test/b.js"></script>
+      <script src="https://cdn.example.test/b.js" integrity="sha384-x"></script>
+    `;
+    const found = extractSubresources(html, PAGE);
+    expect(found.map((r) => [r.url, r.integrity])).toEqual([
+      ["https://cdn.example.test/a.js", null],
+      ["https://cdn.example.test/b.js", null],
+      ["https://cdn.example.test/b.js", "sha384-x"],
+    ]);
+  });
+
   it("integrity 空字串等同沒有；crossorigin 裸屬性是空字串而不是缺少", () => {
     const html = `<script src="https://cdn.example.test/a.js" integrity="" crossorigin></script>`;
     const found = extractSubresources(html, PAGE);
@@ -155,6 +255,17 @@ describe("extractSubresources", () => {
     const found = extractSubresources(html, PAGE);
     expect(found[0]?.isInsecure).toBe(true);
     expect(found[1]?.isInsecure).toBe(false);
+  });
+
+  it("畸形頁面不能拖住掃描器：兩萬個沒有收尾的 script 標籤仍要一瞬間解析完", () => {
+    // 受測站的內容不該有能力決定掃描要跑多久。這條守的是「每個 script 標籤都往文件尾
+    // 找一次 </script>」的二次方掃描：同一份輸入在修正前要 3.7 秒，修正後是數十毫秒。
+    // 門檻取 1.5 秒——遠高於正常值（不會因 CI 機器忙碌就變紅燈），也遠低於退化後的數量級。
+    const hostile = "<script src=/a.js>".repeat(20_000) + "x".repeat(200_000);
+    const startedAt = Date.now();
+    const found = extractSubresources(hostile, PAGE);
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
+    expect(found.map((r) => r.url)).toEqual(["https://app.aios.test/a.js"]);
   });
 });
 
@@ -216,6 +327,20 @@ describe("analyzeSubresources", () => {
       ctx,
     );
     expect(ids(findings)).not.toContain("supply-chain.sri-without-crossorigin.cdn.example.test");
+  });
+
+  it("module 腳本缺 crossorigin 不報——它本來就走 CORS，說「會被拒載」是說錯話", () => {
+    const module = analyzeSubresources(
+      [res({ kind: "script", url: "https://cdn.example.test/esm.js", integrity: "sha384-x", isModule: true })],
+      ctx,
+    );
+    expect(ids(module)).not.toContain("supply-chain.sri-without-crossorigin.cdn.example.test");
+    // 同樣寫法的 classic 腳本則確實會被拒載，必須報——這條規則不是整個關掉，是只對 module 不成立。
+    const classic = analyzeSubresources(
+      [res({ kind: "script", url: "https://cdn.example.test/classic.js", integrity: "sha384-x" })],
+      ctx,
+    );
+    expect(ids(classic)).toContain("supply-chain.sri-without-crossorigin.cdn.example.test");
   });
 
   it("同源資源有 integrity 沒 crossorigin 不報——同源不需要 CORS 就驗得起來", () => {
@@ -282,6 +407,16 @@ describe("analyzeSubresources", () => {
     expect(analyzeSubresources([], ctx)).toEqual([]);
   });
 
+  it("host 為 null 的畸形輸入不會生出 supply-chain.script-no-sri.null 這種假 id", () => {
+    // id 是抑制清單與跨次比對的鍵。一個從壞掉的輸入長出來的 id 會被寫進抑制清單，
+    // 之後永遠對不到任何東西，而寫的人以為自己已經處理過了。
+    const findings = analyzeSubresources(
+      [res({ kind: "script", url: "data:text/javascript,1", host: null, isThirdParty: true })],
+      ctx,
+    );
+    expect(ids(findings).some((id) => id.includes("null"))).toBe(false);
+  });
+
   it("內容會變動的服務會在證據裡註明無法上 SRI，避免有人去試不可能成功的修法", () => {
     const findings = analyzeSubresources(
       [res({ kind: "script", url: "https://www.googletagmanager.com/gtm.js?id=GTM-X" })],
@@ -338,9 +473,134 @@ describe("inventoryByHost", () => {
   });
 
   it("data: 這類沒有主機的引用不進盤點", () => {
-    const summary = inventoryByHost([
-      { kind: "script", url: "data:text/javascript,1", host: null, integrity: null, crossorigin: null, isThirdParty: false, isInsecure: false },
-    ]);
+    const summary = inventoryByHost([res({ kind: "script", url: "data:text/javascript,1", host: null })]);
     expect(summary).toEqual([]);
+  });
+});
+
+/**
+ * checkSupplyChain 的每一條跳過路徑都要驗：這些分支就是「沒測到不可以講成沒問題」的實作，
+ * 而它們失效時不會有任何錯誤訊息——只會多出一份看起來很乾淨的空盤點。
+ */
+describe("checkSupplyChain", () => {
+  /** 分塊送出的回應內文：一次送完的回應讀得完，只有真的超過上限才會被標成截斷。 */
+  function chunkedBody(chunks: number, bytes: number): ReadableStream<Uint8Array> {
+    const chunk = new TextEncoder().encode("x".repeat(bytes));
+    let sent = 0;
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= chunks) {
+          controller.close();
+          return;
+        }
+        sent += 1;
+        controller.enqueue(chunk);
+      },
+    });
+  }
+
+  it("首頁連不上時回未完成，不是回一份沒有第三方的乾淨清單", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("connect ECONNREFUSED 10.0.0.1:443");
+    });
+    const result = await checkSupplyChain(web, 1000);
+    expect(result.completed).toBe(false);
+    expect(result.skippedReason).toContain("首頁無法連線");
+    expect(result.findings).toEqual([]);
+  });
+
+  it("中介層攔截時回未完成——中介層的頁面不是站台的頁面", async () => {
+    vi.stubGlobal("fetch", async () =>
+      new Response("502 Bad Gateway", { status: 502, headers: { "content-type": "text/plain" } }),
+    );
+    const result = await checkSupplyChain(web, 1000);
+    expect(result.completed).toBe(false);
+    expect(result.skippedReason).toContain("中介層攔截");
+  });
+
+  it("首頁回錯誤狀態時回未完成，即使錯誤頁長得跟 SPA 一模一樣", async () => {
+    // 這是最容易漏掉的假綠燈：SPA 的錯誤頁帶著 <div id="root">，
+    // 所以中介層判定不會攔它，而它的 HTML 裡當然一支第三方腳本都沒有。
+    vi.stubGlobal("fetch", async () =>
+      new Response('<!doctype html><html><body><div id="root"></div></body></html>', {
+        status: 500,
+        headers: { "content-type": "text/html" },
+      }),
+    );
+    const result = await checkSupplyChain(web, 1000);
+    expect(result.completed).toBe(false);
+    expect(result.skippedReason).toContain("HTTP 500");
+    expect(result.findings).toEqual([]);
+  });
+
+  it("重導向跟隨上限用完仍是 3xx 時回未完成——手上那份是中繼回應，不是首頁", async () => {
+    vi.stubGlobal("fetch", async () =>
+      new Response("Redirecting…", {
+        status: 302,
+        headers: { location: "https://app.aios.test/next", "content-type": "text/html" },
+      }),
+    );
+    const result = await checkSupplyChain(web, 1000);
+    expect(result.completed).toBe(false);
+    expect(result.skippedReason).toContain("重導向");
+  });
+
+  it("首頁不是 HTML 時回未完成，並說明沒有子資源可盤點", async () => {
+    vi.stubGlobal("fetch", async () =>
+      new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    const result = await checkSupplyChain(web, 1000);
+    expect(result.completed).toBe(false);
+    expect(result.skippedReason).toContain("content-type");
+  });
+
+  it("HTML 被讀取上限截斷時回未完成——不完整的盤點會被讀成完整清單", async () => {
+    vi.stubGlobal("fetch", async () =>
+      new Response(chunkedBody(6, 200_000), { status: 200, headers: { "content-type": "text/html" } }),
+    );
+    const result = await checkSupplyChain(web, 1000);
+    expect(result.completed).toBe(false);
+    expect(result.skippedReason).toContain("截斷");
+    expect(result.facts?.truncated).toBe(true);
+  });
+
+  it("正常首頁：只送一個 GET，盤點寫進 facts，第三方問題寫進 findings", async () => {
+    const html = `<!doctype html>
+      <html><head>
+        <link rel="stylesheet" href="/assets/app.css">
+        <script type="module" crossorigin src="/assets/index-abc123.js"></script>
+        <script src="https://cdn.example.test/lib.js"></script>
+      </head><body><div id="root"></div></body></html>`;
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", async (input: string | URL, init?: RequestInit) => {
+      calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+      return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+    });
+
+    const result = await checkSupplyChain(web, 1000);
+    expect(result.completed).toBe(true);
+    // 檢測系統不該污染它要測量的東西：一次讀取就夠，而且只能是讀取方法。
+    expect(calls).toEqual(["GET https://app.aios.test/"]);
+    expect(result.facts?.subresources).toBe(3);
+    expect(result.facts?.thirdPartyHosts).toEqual(["cdn.example.test"]);
+    expect(ids(result.findings)).toEqual([
+      "supply-chain.script-no-sri.cdn.example.test",
+      "supply-chain.third-party-inventory",
+    ]);
+    expect(result.findings[0]?.where).toBe("https://app.aios.test/");
+  });
+
+  it("首頁完全沒有第三方資源時完成且零發現——那是真的測到了「沒有」", async () => {
+    vi.stubGlobal("fetch", async () =>
+      new Response(
+        '<!doctype html><html><head><script type="module" src="/assets/index.js"></script></head>' +
+          '<body><div id="root"></div></body></html>',
+        { status: 200, headers: { "content-type": "text/html" } },
+      ),
+    );
+    const result = await checkSupplyChain(web, 1000);
+    expect(result.completed).toBe(true);
+    expect(result.findings).toEqual([]);
+    expect(result.facts?.thirdPartyHosts).toEqual([]);
   });
 });
