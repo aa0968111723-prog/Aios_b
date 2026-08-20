@@ -48,7 +48,8 @@
 | `csp.frame-ancestors` | medium | 缺 `frame-ancestors`。**此指令不吃 `default-src` 兜底**，是規格特例 |
 | `csp.style-src.unsafe-inline` | low | ai_os 已知取捨（React inline style），標為 low 並註明 |
 | `csp.connect-src.wildcard` | low | `connect-src *` 放大 XSS 的外洩管道 |
-| `csp.reporting.*` | info | 是否設定違規回報 |
+| `csp.reporting.present` / `csp.reporting.missing` | info | 是否設定違規回報端點 |
+| `csp.frame-ancestors.wildcard` | medium | `frame-ancestors` 放行任意來源，等於沒有防點擊劫持 |
 
 ## cookies
 
@@ -206,6 +207,37 @@
 同源子資源不報 SRI（那是自家部署，SRI 只增加發版負擔而沒有對應威脅）。
 限制要講清楚：**只看初始 HTML，動態插入的腳本看不到**——那是 `pages` 端頁面測試的守備範圍。
 
+## wellknown
+
+`robots.txt` 與 `security.txt` 是站台對外的兩份公告。
+
+| id | 等級 | 判定 |
+| --- | --- | --- |
+| `wellknown.robots.sensitive-paths` | low | `Disallow` 裡出現看起來敏感的路徑。robots.txt 是**公開文件**，把 `/admin-panel` 寫進去等於幫攻擊者做完目錄探勘——它從來不是存取控制 |
+| `wellknown.robots.missing` | info | 沒有 robots.txt。**這不構成資安問題**，只是記錄 |
+| `wellknown.security-txt.missing` | low | 沒有 `/.well-known/security.txt`。善意的通報者找不到聯絡方式通常就放棄了，惡意的那位不會 |
+| `wellknown.security-txt.no-contact` | low | 有檔案但缺 `Contact`（RFC 9116 唯一必填欄位） |
+| `wellknown.security-txt.expired` | low | `Expires` 已過。依 RFC 9116，過期的 security.txt 不應被信任，等於沒有 |
+| `wellknown.security-txt.no-expires` | info | 缺 `Expires` |
+
+頭號陷阱是 SPA 兜底：不先排除，會得到「robots.txt 存在且內容異常」的整排假警報。
+
+## rate-limit
+
+沒有速率限制的登入端點，等於把「試到對為止」外包給攻擊者的頻寬。
+
+| id | 等級 | 判定 |
+| --- | --- | --- |
+| `rate-limit.login.absent` | high | 連續失敗嘗試沒有觸發 429／`Retry-After`，回應時間也沒有遞增 |
+| `rate-limit.login.present` | info | 觀測到速率限制生效，記錄在第幾次觸發。**正面觀測也要輸出**——維運者需要知道哪些防護確實在運作 |
+| `rate-limit.login.inconclusive` | info | 樣本無法判定（找不到登入端點、5xx、被中介層攔截）。「找不到登入端點」不等於「沒有速率限制」 |
+| `rate-limit.login.error-leak` | medium | 失敗回應會因帳號是否存在而不同（使用者列舉） |
+
+**預設不執行。** 它會對登入端點送出數次失敗嘗試：在有帳號鎖定的系統上可能鎖住真實使用者，
+在有告警的系統上會製造一次假的攻擊事件。必須以 `--probe-rate-limit` 明確授權。
+啟用時序列送出、用明顯是探測用的假帳號（**不會**用 `TEST_EMAIL`——那會鎖住真的測試帳號），
+觀測到 429 就立刻停止。
+
 ## health
 
 | id | 等級 | 判定 |
@@ -264,7 +296,9 @@
 | `shell.tauri.dangerous-ipc` | high | `dangerousRemoteDomainIpcAccess` |
 | `shell.tauri.csp-null` | medium | `security.csp` 為 null（桌面端完全靠遠端站標頭撐著） |
 | `shell.tauri.devtools` | medium | 發布版開著 devtools |
-| `shell.target-mismatch.capacitor` / `.tauri` | high | 殼層指向的站與受測目標不同 |
+| `shell.target-mismatch.capacitor` / `shell.target-mismatch.tauri` | high | 殼層指向的站與受測目標不同 |
+| `shell.tauri.capability-local.<id>` | low | 同一組能力同時開放本地與遠端，授權範圍難以稽核 |
+| `shell.tauri.unparseable` | low | tauri.conf.json 不是有效 JSON，桌面殼層**未稽核** |
 | `shell.deeplink-mismatch` | medium | 深層連結 host 與 App 載入的站不一致 |
 
 **解析前一律剝除註解。** 被註解掉的本機開發設定（`// url: "http://192.168.1.10:5173"`、
@@ -309,6 +343,8 @@
 - `ERR_ABORTED`（換頁取消）不算請求失敗
 
 ## a11y
+
+發現 id 為 `a11y.<axe 規則 id>`（例如 `a11y.color-contrast`）。
 
 axe-core WCAG 2.0/2.1 A+AA。impact 對應：`critical`→high、`serious`→medium、
 `moderate`→low、`minor` 不報。同規則跨路由聚合成一筆，附上出現的頁面清單。
@@ -383,3 +419,27 @@ axe-core WCAG 2.0/2.1 A+AA。impact 對應：`critical`→high、`serious`→med
 | `device.persona-mismatch.<surface>` | low | 該端裝置人格內部不一致（標為行動卻是桌面 UA／寬視窗） |
 | `device.blocked.<surface>` | high | 只有此裝置被伺服器回 403/451 而其他端正常（按裝置歧視／WAF 誤擋） |
 | `device.unobserved.<surface>` | low | 這一端連不上，帳本裡有它的人格但沒有實測回應——跨端比對缺了它 |
+
+---
+
+# 工具自身的發現
+
+這些不是站台的問題，是**檢測系統自己的狀態**。它們與站台的發現並列在同一份清單裡，
+理由與「跳過不等於通過」同源：一個沒生效的抑制規則、一份讀不出來的基準，都會讓讀者
+對報告產生錯誤的信任，而那種錯誤不會報錯，只會安靜地存在。
+
+## suppress（抑制清單）
+
+| id | 等級 | 判定 |
+| --- | --- | --- |
+| `suppress.invalid-rule.<id>` | medium | 規則無法使用（缺 id、reason 空白…）。它沒有生效，但寫下它的人此刻相信那件事已經被處理掉了 |
+| `suppress.critical-requires-ack` | medium | 規則要蓋掉 critical 級發現但沒有 `acknowledgeCritical: true`。該筆發現照常回報 |
+| `suppress.expired` | low | 規則已過期，不再生效，被蓋住的發現重新浮現 |
+| `suppress.stale` | info | 規則整輪沒有命中任何發現。死規則會在問題復發時把它靜默吃掉 |
+| `suppress.no-expiry` | info | 規則沒有到期日。允許，但永久抑制應該極少——沒有到期日就不會有人回來重新評估 |
+
+## baseline（跨次比對）
+
+| id | 等級 | 判定 |
+| --- | --- | --- |
+| `baseline.unreadable` | medium | 基準檔讀不出來，本輪沒有比對。**不會**當成空基準：那會讓所有存量問題被報成新增；反過來當成「沒有變化」則會讓真正的新增被吃掉 |
