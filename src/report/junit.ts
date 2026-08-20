@@ -30,7 +30,12 @@ const SEVERITY_LABEL: Record<Severity, string> = {
  */
 const XML_ILLEGAL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
 
-/** 屬性值與文字節點共用一套跳脫：屬性用雙引號，內文可能被貼進別處，寧可一律跳脫。 */
+/**
+ * 文字節點與屬性值共用的基本跳脫（屬性另外再包一層 `escapeAttr`）。
+ *
+ * 引號在文字節點裡其實不必跳脫，這裡照跳是刻意的：報告裡的字串常被讀者複製到別處
+ * （貼進屬性、貼進另一份 XML），少跳一種字元換不到任何好處，漏跳一次卻是整份檔案作廢。
+ */
 export function escapeXml(text: string): string {
   return text
     .replace(XML_ILLEGAL, "")
@@ -97,13 +102,12 @@ const EVIDENCE_LIMIT = 1200;
 
 function clipEvidence(evidence: string): string {
   if (evidence.length <= EVIDENCE_LIMIT) return evidence;
-  // JavaScript 的字串以 UTF-16 計長，而表情符號與部分 CJK 擴充字佔兩個單位。
-  // 剛好切在中間會留下半個代理對——那不是合法字元，寫進檔案時會變成一個問號方塊，
-  // 而讀者會以為是站台真的回了亂碼。少留一個字元，比留下一段假的觀測值好。
-  const head = evidence.charCodeAt(EVIDENCE_LIMIT - 1) >= 0xd800 && evidence.charCodeAt(EVIDENCE_LIMIT - 1) <= 0xdbff
-    ? EVIDENCE_LIMIT - 1
-    : EVIDENCE_LIMIT;
-  return `${evidence.slice(0, head)}…（證據已截斷）`;
+  // JavaScript 以 UTF-16 計算字串長度，而表情符號與部分 CJK 擴充字佔兩個單位。
+  // 這一刀剛好落在中間就會留下半個代理對——那不是合法字元，寫進檔案後會變成一個問號方塊，
+  // 而讀者會把它讀成「站台真的回了亂碼」。少留一個字元，比留下一段報告自己造出來的假觀測值好。
+  const lastUnit = evidence.charCodeAt(EVIDENCE_LIMIT - 1);
+  const cut = lastUnit >= 0xd800 && lastUnit <= 0xdbff ? EVIDENCE_LIMIT - 1 : EVIDENCE_LIMIT;
+  return `${evidence.slice(0, cut)}…（證據已截斷）`;
 }
 
 /**

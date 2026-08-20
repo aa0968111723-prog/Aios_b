@@ -143,6 +143,13 @@ describe("escapeXml", () => {
   it("一般文字原樣通過", () => {
     expect(escapeXml("憑證將於 30 天內到期")).toBe("憑證將於 30 天內到期");
   });
+
+  it("已經跳脫過的字串會再被跳脫一次——跳脫只能在輸出的那一刻做，呼叫端不可以先做一次", () => {
+    // 這條是在把契約釘住，不是在描述缺陷：若這裡改成「認得 &amp; 就放過」，
+    // 一份原文真的寫著 `&amp;` 的回應（HTML 原始碼是常見證據）就會被還原成 `&`，
+    // 讀者看到的證據與站台實際回的內容從此對不起來。
+    expect(escapeXml("&amp;")).toBe("&amp;amp;");
+  });
 });
 
 describe("renderJunit", () => {
@@ -401,5 +408,124 @@ describe("renderJunit", () => {
     // 沒有過濾就不該多出這一段雜訊。
     expect(renderJunit(makeReport({ filter: { only: [], skip: [] } }), "high")).not.toContain("檢測涵蓋範圍");
     expect(renderJunit(makeReport(), "high")).not.toContain("檢測涵蓋範圍");
+  });
+
+  it("一項檢查結果都沒有時要自己說出來——tests=\"0\" 在每個面板上都是綠的", () => {
+    const xml = renderJunit(makeReport({ results: [] }), "high");
+    expect(xml.split("\n")[1]).not.toContain('tests="0"');
+    expect(xml).toContain("沒有任何檢查被執行");
+    expect(xml).toContain("不是全部通過，是什麼都沒測");
+    expect(occurrences(xml, "<skipped ")).toBe(1);
+    expect(occurrences(xml, "<testcase ")).toBe(1);
+    expect(xmlProblems(xml)).toEqual([]);
+  });
+
+  it("同一種問題出現在兩個位置時，兩筆 testcase 的身分不會互相蓋掉", () => {
+    // 面板以 classname + name 當測試主鍵，同名會被折成一筆——
+    // 於是兩處的問題在畫面上只剩一處，而消失的那一處不會有任何提示。
+    const xml = renderJunit(
+      makeReport({
+        results: [
+          makeResult({
+            check: "disclosure",
+            findings: [
+              makeFinding({ id: "disclosure.stack-trace", where: "/api/a" }),
+              makeFinding({ id: "disclosure.stack-trace", where: "/api/b" }),
+            ],
+          }),
+        ],
+      }),
+      "high",
+    );
+    const identities = testcaseIdentities(xml);
+    expect(identities).toHaveLength(2);
+    expect(new Set(identities).size).toBe(2);
+    // 位置補進名稱，讀者才知道那兩筆分別在講哪一處。
+    expect(xml).toContain('name="disclosure.stack-trace（/api/a）"');
+    expect(xml).toContain('name="disclosure.stack-trace（/api/b）"');
+    expect(occurrences(xml, "<failure ")).toBe(2);
+  });
+
+  it("連位置都相同的兩筆同 id 發現也各自保有身分", () => {
+    const xml = renderJunit(
+      makeReport({
+        results: [
+          makeResult({
+            check: "page-test",
+            findings: [
+              makeFinding({ id: "page.js-exception./", where: "/" }),
+              makeFinding({ id: "page.js-exception./", where: "/" }),
+            ],
+          }),
+        ],
+      }),
+      "high",
+    );
+    expect(new Set(testcaseIdentities(xml)).size).toBe(2);
+  });
+
+  it("只有一筆時名稱維持純 id——名稱是跨次執行辨認同一項的依據，沒撞名就不該變動", () => {
+    const xml = renderJunit(
+      makeReport({ results: [makeResult({ check: "cors", findings: [makeFinding({ id: "cors.wildcard", where: "/api" })] })] }),
+      "high",
+    );
+    expect(xml).toContain('<testcase name="cors.wildcard" classname="aios-sentinel.security"');
+  });
+
+  it("耗時不是有限數時 time 不會輸出 NaN——那會讓嚴格的解析器拒收整份檔案", () => {
+    const xml = renderJunit(
+      makeReport({ durationMs: Number.NaN, results: [makeResult({ check: "health", durationMs: Number.NaN })] }),
+      "high",
+    );
+    expect(xml).not.toContain("NaN");
+    expect(occurrences(xml, 'time="0.000"')).toBeGreaterThan(0);
+  });
+
+  it("超長證據截斷時不會切斷代理對——半個字元寫進報告，讀者會以為站台回了亂碼", () => {
+    const evidence = `${"x".repeat(1199)}😀 尾巴`;
+    const xml = renderJunit(
+      makeReport({ results: [makeResult({ check: "disclosure", findings: [makeFinding({ id: "disclosure.body", evidence })] })] }),
+      "high",
+    );
+    expect(hasLoneSurrogate(xml)).toBe(false);
+    expect(xml).toContain("（證據已截斷）");
+  });
+
+  it("多行的執行錯誤在屬性裡用字元參照保留換行，錯誤原文也留在內文", () => {
+    // XML 規定解析器要把屬性值裡的換行正規化成空白，直接寫進去的話堆疊會被壓成一行。
+    // 而不同面板顯示的位置不一樣（有的只列 message，有的只在展開時給內文），兩邊都要放。
+    const xml = renderJunit(
+      makeReport({
+        results: [makeResult({ check: "cors", completed: false, error: "TypeError: fetch failed\n    at probe (http.ts:1)" })],
+      }),
+      "high",
+    );
+    expect(xml).toContain('message="TypeError: fetch failed&#10;    at probe (http.ts:1)"');
+    expect(xml).toContain("at probe (http.ts:1)</error>");
+    expect(xmlProblems(xml)).toEqual([]);
+  });
+
+  it("檢查沒跑完但已經測到東西時，發現與 skipped 兩者都要出現", () => {
+    // 例如裝置紀錄只有部分端連得到：測到的那幾筆是真的發現，沒測到的那幾端仍然沒有結論。
+    // 少了 skipped，這一項在面板上會變成「跑完了，只有這些問題」。
+    const xml = renderJunit(
+      makeReport({
+        results: [
+          makeResult({
+            check: "device",
+            category: "monitoring",
+            surface: "all",
+            completed: false,
+            skippedReason: "桌面端連不到站台，未建立裝置紀錄。",
+            findings: [makeFinding({ id: "device.blocked.app", category: "monitoring", severity: "critical" })],
+          }),
+        ],
+      }),
+      "high",
+    );
+    expect(xml).toContain('<testcase name="device.blocked.app"');
+    expect(xml).toContain('<failure type="critical"');
+    expect(xml).toContain('<skipped message="桌面端連不到站台，未建立裝置紀錄。" />');
+    expect(xml).toContain('tests="2" failures="1" errors="0" skipped="1"');
   });
 });

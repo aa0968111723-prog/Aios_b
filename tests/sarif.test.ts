@@ -309,6 +309,32 @@ describe("沒測到的部分（toolExecutionNotifications）", () => {
     expect(run.invocations[0]!.executionSuccessful).toBe(true);
   });
 
+  it("跳過原因沒有句尾標點時不會跟後面的提醒黏成一句", () => {
+    const run = firstRun(
+      makeReport({
+        results: [
+          makeResult({ check: "transport" }),
+          // 偵測器實際寫出來的原因常常沒有句號，例如 `首頁無法連線：fetch failed`。
+          makeResult({ check: "transport", completed: false, skippedReason: "首頁無法連線：fetch failed" }),
+        ],
+      }),
+    );
+    const text = run.invocations[0]!.toolExecutionNotifications[0]!.message.text;
+    expect(text).toContain("首頁無法連線：fetch failed。跳過不等於通過");
+  });
+
+  it("後製的 meta 結果不會被講成「某項檢查沒跑到」——讀者會去找一項根本不存在的檢查", () => {
+    const run = firstRun(
+      makeReport({
+        results: [
+          makeResult({ check: "transport" }),
+          makeResult({ check: "suppress", category: "integrity", surface: "all", meta: true, completed: false }),
+        ],
+      }),
+    );
+    expect(run.invocations[0]!.toolExecutionNotifications).toEqual([]);
+  });
+
   it("跳過卻沒記錄原因時照樣出聲，不會因為少一段文字就被當成通過", () => {
     const run = firstRun(
       makeReport({ results: [makeResult({ check: "transport" }), makeResult({ check: "a11y", completed: false })] }),

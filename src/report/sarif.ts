@@ -149,8 +149,9 @@ const NOTIFICATION_DESCRIPTORS: SarifNotificationDescriptor[] = [
     shortDescription: { text: "本輪沒有任何檢查真正執行完成" },
     fullDescription: {
       text:
-        "所有檢查都被跳過、被過濾或自己爆掉。此時 results 是空的，而一份沒有 result 的 SARIF " +
-        "在 code scanning 上與「全部通過」長得一模一樣，所以同一輪也會把 executionSuccessful 標成 false。",
+        "所有檢查都被跳過、被過濾或自己爆掉。此時 results 若不是空的，也只剩後製的提醒，" +
+        "而一份沒有 result 的 SARIF 在 code scanning 上與「全部通過」長得一模一樣，" +
+        "所以同一輪也會把 executionSuccessful 標成 false。",
     },
   },
   {
@@ -329,6 +330,18 @@ function completedCheckCount(report: RunReport): number {
 }
 
 /**
+ * 補上句尾標點。
+ *
+ * 跳過原因是各個偵測器自己寫的，句尾有沒有句號並不一致（`首頁無法連線：fetch failed` 就沒有）。
+ * 直接接上後面那句提醒的話，讀者會看到「首頁無法連線：fetch failed跳過不等於通過」——
+ * 一句黏成兩句的訊息會讓人以為是程式湊字串出錯，連帶不信任這份報告的其他內容。
+ */
+function endSentence(text: string): string {
+  const trimmed = text.trim();
+  return /[。．.!?！？；;：:]$/.test(trimmed) ? trimmed : `${trimmed}。`;
+}
+
+/**
  * 「這一輪有哪些事沒跑到」——SARIF 裡唯一能承載這個資訊的地方。
  *
  * 四種都算沒跑到：一項都沒跑完、檢查自己爆掉、檢查被跳過、以及本輪範圍被
@@ -376,6 +389,10 @@ function buildNotifications(report: RunReport): SarifNotification[] {
   }
 
   for (const result of report.results) {
+    // meta 結果不是檢查（是抑制清單與基準檔的後製提醒），不該出現在「哪幾項沒跑到」的清單裡：
+    // 讀者會去找一項叫 suppress 的檢查，而那項從來不存在。
+    if (result.meta) continue;
+
     // 執行錯誤與跳過是兩件事，但同一項只該被講一次：爆掉的檢查不必再說它「沒完成」。
     if (result.error) {
       out.push({
@@ -383,7 +400,7 @@ function buildNotifications(report: RunReport): SarifNotification[] {
         level: "error",
         message: {
           text:
-            `檢查「${result.check}」（${result.surface}）執行錯誤：${result.error}。` +
+            `檢查「${result.check}」（${result.surface}）執行錯誤：${endSentence(result.error)}` +
             "這是檢測器自己失敗，不是目標通過——這一項在本次沒有任何結論。",
         },
         properties: { check: result.check, surface: result.surface, category: result.category },
@@ -396,7 +413,7 @@ function buildNotifications(report: RunReport): SarifNotification[] {
         level: "warning",
         message: {
           text:
-            `檢查「${result.check}」（${result.surface}）已跳過：${result.skippedReason ?? "未提供原因。"}` +
+            `檢查「${result.check}」（${result.surface}）已跳過：${endSentence(result.skippedReason ?? "未提供原因")}` +
             "跳過不等於通過，這一項在本次沒有任何結論。",
         },
         properties: { check: result.check, surface: result.surface, category: result.category },
@@ -455,9 +472,10 @@ export function renderSarif(report: RunReport): string {
             // 兩種情況才算「這次執行不成功」：有檢查自己爆掉，或者一項都沒跑完。
             //
             // 少數幾項被跳過不算失敗——那是有意識的略過，已經逐筆寫進 notifications。
-            // 但**一項都沒跑完**是另一回事：那時 results 恆為空，而空的 SARIF 在 code scanning 上
-            // 就是一片綠。這是本專案最反對的假綠燈，與 `exitCodeFor` 特地保留 exit 3 同一個理由，
-            // 所以這裡不靠讀者自己去翻 notifications，直接讓這一輪表態它不成立。
+            // 但**一項都沒跑完**是另一回事：那時候即使有 result，也只是後製的提醒，
+            // 整份檔案在 code scanning 上仍然是一片綠。這是本專案最反對的假綠燈，
+            // 與 `exitCodeFor` 特地保留 exit 3 同一個理由，所以這裡不靠讀者自己去翻 notifications，
+            // 直接讓這一輪表態它不成立。
             executionSuccessful: completedCheckCount(report) > 0 && report.results.every((r) => !r.error),
             startTimeUtc: utcOrUndefined(report.startedAt),
             endTimeUtc: utcOrUndefined(report.finishedAt),
