@@ -42,7 +42,13 @@ npm run sentinel -- all --repo ../ai_os
 | `auth-gate` | 未登入直接打受保護端點：`/api/selftest`、`/api/v1/databases`、`/api/me/export`、素材備份、專案匯出、tRPC 程序…。tRPC 未授權也回 HTTP 200，故改看回應內容判定 |
 | `disclosure` | `.env`、`.git`、原始碼、備份檔、`.npmrc`；source map；錯誤回應洩漏堆疊；目錄列表。**每一筆都先排除 SPA 兜底頁**，否則整排假警報 |
 | `cors` | 反射任意 Origin、`*`、`null` 來源，並與 `allow-credentials` 交叉判定 |
-| `shell-audit` | Capacitor（cleartext、http url、allowNavigation）、AndroidManifest（debuggable、allowBackup、明文流量、多餘權限）、Tauri（`csp: null`、devtools、能力萬用授權、危險 IPC） |
+| `tls` | 憑證到期（7／14／30 天分級）、主機名不符（萬用 SAN 依規格只吃一層）、自簽、弱簽章、過長效期、TLSv1／1.1、弱金鑰。連不上 443 一律標記跳過——把代理擋掉報成憑證問題是嚴重誤判 |
+| `methods` | TRACE 是否開啟與是否回吐請求（Cross-Site Tracing）、`Allow` 洩漏危險方法。**只送 OPTIONS 與 TRACE**——絕不對真實端點送寫入方法 |
+| `redirect` | 開放重導向：常見回跳參數逐一探測，處理協定相對、反斜線、`@` 混淆、子網域四種繞法；落在自家網域不報 |
+| `supply-chain` | 第三方腳本與樣式表盤點、SRI 缺失、有 integrity 卻沒 crossorigin（瀏覽器會直接拒載，靜默壞掉）、http 子資源。只看初始 HTML，動態插入的看不到 |
+| `wellknown` | `robots.txt` 是否把敏感路徑公告出去、`security.txt`（RFC 9116）是否存在且未過期 |
+| `rate-limit` | 登入端點的速率限制。**預設不執行**，需 `--probe-rate-limit` 明確授權——它會送出數次失敗嘗試，可能觸發帳號鎖定或資安告警 |
+| `shell-audit` | Capacitor（cleartext、http url、allowNavigation）、AndroidManifest（debuggable、allowBackup、明文流量、多餘權限）、Tauri（`csp: null`、devtools、能力萬用授權、危險 IPC）。解析前一律剝除註解——被註解掉的本機開發設定照收，會讓正常專案噴出整排 critical |
 
 ### 可用性與一致性
 
