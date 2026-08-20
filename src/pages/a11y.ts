@@ -87,29 +87,57 @@ export async function checkA11y(
 
   // 同一個違規規則會在多個路由重複出現，以 ruleId 聚合後只報一次，附上出現的路由。
   const byRule = new Map<string, { violation: AxeViolation; routes: string[]; nodes: string[] }>();
+  /** 實際掃到的路由。0 代表這一輪根本沒掃到任何頁面。 */
+  const scanned: string[] = [];
+  const skippedRoutes: Array<{ route: string; reason: string }> = [];
+  /** 被重導向到別處的路由（未登入時受保護頁一律導到 /login）。 */
+  const redirectedRoutes: Array<{ route: string; landedOn: string }> = [];
 
   for (const route of routes) {
     const url = join(surface.origin, route.path);
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
       await page.locator(SELECTORS.shell).waitFor({ state: "attached", timeout: 15_000 });
-    } catch {
-      continue; // 頁面本身壞掉由 page-test 負責報告
+    } catch (err) {
+      // 頁面本身壞掉由 page-test 負責報告，但**這裡沒掃到**這件事必須留下來，
+      // 否則「N 個頁面」這個敘述會沒有分母，零發現也會與「全部通過」無從區分。
+      skippedRoutes.push({ route: route.path, reason: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) });
+      continue;
     }
+
+    // 實際落點才是這次掃的東西。
+    //
+    // 未登入時（TEST_EMAIL 沒設就是預設情況）受保護路由一律被導到 /login，於是同一個登入頁
+    // 會被掃 N 次，同一筆違規也被記 N 次——報告會寫「color-contrast（5 個頁面）」並列出五條
+    // 從來沒被掃到的路徑。那個數字與那份清單都是錯的。
+    const landedPath = await page
+      .evaluate(() => location.pathname)
+      .catch(() => route.path);
+
+    if (landedPath !== route.path) {
+      redirectedRoutes.push({ route: route.path, landedOn: landedPath });
+      // 已經掃過那個落點就不重複掃，也不重複計數。
+      if (scanned.includes(landedPath)) continue;
+    }
+
+    const scanKey = landedPath;
 
     let results: { violations: AxeViolation[] };
     try {
       results = await new AxeBuilder({ page })
         .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
         .analyze();
-    } catch {
+    } catch (err) {
+      skippedRoutes.push({ route: route.path, reason: `axe 掃描失敗：${err instanceof Error ? err.message.slice(0, 160) : String(err)}` });
       continue;
     }
+
+    scanned.push(scanKey);
 
     for (const violation of results.violations) {
       if (mapImpact(violation.impact) === null) continue;
       const entry = byRule.get(violation.id) ?? { violation, routes: [], nodes: [] };
-      entry.routes.push(route.path);
+      if (!entry.routes.includes(scanKey)) entry.routes.push(scanKey);
       for (const node of violation.nodes.slice(0, 2)) {
         const snippet = (node.html ?? node.target?.join(" ") ?? "").slice(0, 160);
         if (snippet && !entry.nodes.includes(snippet)) entry.nodes.push(snippet);
@@ -136,6 +164,25 @@ export async function checkA11y(
   }
 
   facts.rulesViolated = [...byRule.keys()];
+  facts.scannedRoutes = scanned;
+  facts.skippedRoutes = skippedRoutes;
+  facts.redirectedRoutes = redirectedRoutes;
+
   await page.close().catch(() => {});
+
+  // 一條都沒掃到時，「零發現」與「全部通過」在報告上完全無法區分。
+  if (scanned.length === 0) {
+    return {
+      ...base,
+      completed: false,
+      skippedReason:
+        `${routes.length} 條路由都無法載入或掃描，無障礙檢查實際未執行。` +
+        (skippedRoutes[0] ? `第一條的原因：${skippedRoutes[0].reason}` : ""),
+      durationMs: elapsed(),
+      findings,
+      facts,
+    };
+  }
+
   return { ...base, completed: true, durationMs: elapsed(), findings, facts };
 }

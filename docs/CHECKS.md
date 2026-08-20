@@ -280,6 +280,7 @@
 
 | id | 等級 | 判定 |
 | --- | --- | --- |
+| `page.navigation-failed.<route>` | high | 瀏覽器沒能載入這條路由（連線失敗、逾時、回應觸發下載）。**此時直接收工**——導覽失敗時瀏覽器停在上一頁，所有 DOM 觀測都是上一個路由的 |
 | `page.server-error.<route>` | critical | HTTP 5xx |
 | `page.shell-not-mounted.<route>` | critical | `div.app` 15 秒內未出現。**此時直接收工**，不產生次生告警 |
 | `page.content-stuck.<route>` | high | 主內容 20 秒仍只有「載入中…」佔位 |
@@ -288,7 +289,7 @@
 | `page.console-errors.<route>` | medium | console.error |
 | `page.failed-requests.<route>` | medium | 資源連線層失敗（被 CSP 擋、網域解析失敗） |
 | `page.overflow.<route>` | medium／low | 橫向溢出，行動端為 medium |
-| `page.slow.<route>` | medium | 載入 > 10 秒 |
+| `page.slow.<route>` | medium | 外殼掛載 > 10 秒，**且主內容確實出來了**。內容沒就緒的頁面該報 content-stuck，再多報一筆「慢」只是在報告自己的等待上限 |
 | `page.broken-images.<route>` | low | 圖片 `naturalWidth === 0` |
 | `page.touch-targets.<route>` | low | 行動端觸控目標 < 44px |
 | `page.no-title.<route>` / `page.no-h1.<route>` | low | 缺標題（h1 僅在內容就緒時才判） |
@@ -296,14 +297,29 @@
 
 **降噪規則**（沒有這些，報告會失去可信度）：
 
-- 未登入巡覽受保護路由時，401/403 與「卡在載入中」都是**正確行為**，不報
-- console 噪音過濾：favicon、React DevTools 提示、vite HMR、ResizeObserver loop
+- **未登入時，任何路由上的 401/403 都是正確行為**，不報。判準是「這一輪有沒有登入」而不是
+  「這條路由需不需要登入」——`/` 與 `/login` 標的是 `requiresAuth: false`，但前端在這兩頁一定會打
+  session 查詢，用路由屬性當條件等於在每次未登入巡覽的首頁上製造假警報。
+  同一條規則也套在 console 訊息上：Chromium 會為同一個 401 另外印一筆 `Failed to load resource`，
+  只擋 `badResponses` 的話 `console-errors` 還是會單獨噴出來。
+- 未登入巡覽受保護路由時，「卡在載入中」與「慢」都豁免
+- console 噪音過濾分兩組：**URL 樣式比對 `location().url`，文字樣式比對訊息**。
+  Chromium 的資源載入錯誤訊息裡沒有 URL，只比對文字的話 favicon 那條規則永遠不會命中。
+  記錄時把 URL 併進字串，否則這筆發現事後無從追查。
 - `ERR_ABORTED`（換頁取消）不算請求失敗
 
 ## a11y
 
 axe-core WCAG 2.0/2.1 A+AA。impact 對應：`critical`→high、`serious`→medium、
 `moderate`→low、`minor` 不報。同規則跨路由聚合成一筆，附上出現的頁面清單。
+
+聚合的鍵是**實際落點**，不是請求的路由。未登入時（沒設 `TEST_EMAIL` 就是預設情況）受保護路由
+一律被導到 `/login`，同一個登入頁會被掃 N 次、同一筆違規被記 N 次——報告會寫「（5 個頁面）」
+並列出五條從來沒被掃到的路徑，那個數字與那份清單都是錯的。被重導向的路由記進
+`facts.redirectedRoutes`，不計入受影響頁面。
+
+一條路由都沒掃到時整項回 `completed: false`——否則「零發現」與「全部通過」在報告上完全無法區分。
+部分失敗的路由與原因記進 `facts.skippedRoutes`，讓「N 個頁面」這種敘述有分母可對。
 
 只在網頁端跑一次——三端載的是同一份 DOM，重複掃只會產生三份一模一樣的違規清單。
 

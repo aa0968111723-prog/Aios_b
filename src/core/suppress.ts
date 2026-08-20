@@ -397,9 +397,13 @@ function staleNote(rule: SuppressionRule): Finding {
     where: ruleLocation(rule),
     title: "抑制規則本輪沒有命中任何發現",
     detail:
-      `規則 ${rule.id} 這次沒有蓋住任何東西，通常代表問題已經修好了。` +
-      "留著不刪的風險是：同一個問題日後復發時會被它靜默吃掉，報告依然全綠。",
-    remediation: "確認問題確實已修復後刪除這條規則；若只是這次沒掃到該路徑，請改用更精確的 where。",
+      `規則 ${rule.id} 這次沒有蓋住任何東西，最常見的原因是問題已經修好了。` +
+      "留著不刪的風險是：同一個問題日後復發時會被它靜默吃掉，報告依然全綠。" +
+      "但「沒命中」不等於「已修好」——本輪用 --only／--skip 縮小過範圍，或對應的檢查被跳過（缺原始碼、缺瀏覽器）時，" +
+      "那些發現根本沒有機會產生，規則自然也命中不到。刪之前請先確認這次真的測到了那一項。",
+    remediation:
+      "先看報告裡對應的檢查是不是「已完成」：完成了才代表問題確實不見了，這時請刪掉這條規則；" +
+      "若是被跳過或被過濾掉，請保留規則，改在有跑到那項檢查的那一輪再判斷。",
     evidence: describeRule(rule),
   });
 }
@@ -412,12 +416,18 @@ function noExpiryNote(rule: SuppressionRule, matched: Finding[]): Finding {
     where: ruleLocation(rule),
     title: "抑制規則沒有到期日（永久抑制）",
     detail:
-      `規則 ${rule.id} 沒有 expires，會一直蓋住 ${listIds(matched)}（本次 ${matched.length} 筆）。` +
+      `規則 ${rule.id} 沒有 expires，命中的 ${listIds(matched)}（本次 ${matched.length} 筆）只要規則還在就會一直被蓋下去。` +
       "永久抑制等於對這個問題永久失明——沒有到期日就不會有人回來重新評估，永久抑制應該極少。",
     remediation: "補上 expires（建議不超過 90 天）；到期時規則自動失效，強迫重新做一次決定。",
     evidence: describeRule(rule),
   });
 }
+
+/** 一條規則在本輪的處置。先全部判完再產生提醒，理由見 `applySuppressions`。 */
+type RuleDecision =
+  | { kind: "stale"; rule: SuppressionRule }
+  | { kind: "expired"; rule: SuppressionRule; matched: Finding[] }
+  | { kind: "applied"; rule: SuppressionRule; matched: Finding[]; blocked: Finding[] };
 
 /**
  * 套用抑制清單。
@@ -432,7 +442,17 @@ function noExpiryNote(rule: SuppressionRule, matched: Finding[]): Finding {
  * `now` 由呼叫端傳入而非在函式內取現在時間——到期判定必須能在測試裡固定住。
  *
  * 「哪一筆是同一筆」一律用 `findingKey`（id + where），與去重、跨次執行比對同一把鍵：
- * 三者用不同的鍵時，「上次抑制掉的」與「這次新增的」會對不起來。
+ * 三者用不同的鍵時，「上次抑制掉的」與「這次新增的」會對不起來。**攔截與認領必須用同一把鍵**：
+ * 三端掃同一個站時，同一筆問題會由不同 surface 各回報一次（id 與 where 相同、物件不同），
+ * 若攔截認物件、認領認鍵，那筆被擋下的 critical 會從另一個孿生物件的鍵溜進 suppressed——
+ * 一個沒有人會發現的假綠燈。
+ *
+ * 提醒統一等到認領定案後才產生：`suppress.critical-requires-ack` 說的是「這筆仍然照常回報」，
+ * 而同一筆 critical 可能被另一條有 ack 的規則合法蓋掉（廣泛規則 + 個別具名規則是常見寫法）。
+ * 邊判邊寫提醒的話，報告會出現一句與事實相反的話——比不寫還糟。
+ *
+ * 回傳的 `kept`／`suppressed` 一律是**原本那些物件**，不做任何複製：呼叫端
+ * （`annotate.ts`）靠物件同一性把發現放回各自的 CheckResult，複製一份會讓整份報告清空。
  */
 export function applySuppressions(
   findings: Finding[],
@@ -440,33 +460,29 @@ export function applySuppressions(
   now: Date,
 ): SuppressionOutcome {
   const claimed = new Map<string, SuppressionRule>();
-  const notes: Finding[] = [];
+  const decisions: RuleDecision[] = [];
 
   for (const rule of rules) {
     const matched = findings.filter((f) => ruleMatches(rule, f));
     if (matched.length === 0) {
-      notes.push(staleNote(rule));
+      decisions.push({ kind: "stale", rule });
       continue;
     }
 
     if (isExpired(rule, now)) {
-      notes.push(expiredNote(rule, matched));
+      decisions.push({ kind: "expired", rule, matched });
       continue;
     }
 
-    const blocked = new Set(
-      rule.acknowledgeCritical ? [] : matched.filter((f) => f.severity === "critical"),
-    );
-    if (blocked.size > 0) notes.push(criticalAckNote(rule, [...blocked]));
-
+    const blocked = rule.acknowledgeCritical ? [] : matched.filter((f) => f.severity === "critical");
+    const blockedKeys = new Set(blocked.map(findingKey));
     for (const f of matched) {
-      if (blocked.has(f)) continue;
-      // 先命中的規則負責這筆：兩條規則蓋同一筆時，報告只需要說明其中一條。
       const key = findingKey(f);
+      if (blockedKeys.has(key)) continue;
+      // 先命中的規則負責這筆：兩條規則蓋同一筆時，報告只需要說明其中一條。
       if (!claimed.has(key)) claimed.set(key, rule);
     }
-
-    if (!rule.expires) notes.push(noExpiryNote(rule, matched));
+    decisions.push({ kind: "applied", rule, matched, blocked });
   }
 
   const kept: Finding[] = [];
@@ -475,6 +491,21 @@ export function applySuppressions(
     const rule = claimed.get(findingKey(f));
     if (rule) suppressed.push({ finding: f, rule });
     else kept.push(f);
+  }
+
+  const notes: Finding[] = [];
+  for (const decision of decisions) {
+    if (decision.kind === "stale") {
+      notes.push(staleNote(decision.rule));
+      continue;
+    }
+    if (decision.kind === "expired") {
+      notes.push(expiredNote(decision.rule, decision.matched));
+      continue;
+    }
+    const stillReported = decision.blocked.filter((f) => !claimed.has(findingKey(f)));
+    if (stillReported.length > 0) notes.push(criticalAckNote(decision.rule, stillReported));
+    if (decision.rule.expires === undefined) notes.push(noExpiryNote(decision.rule, decision.matched));
   }
 
   return { kept, suppressed, notes };

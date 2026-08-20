@@ -148,6 +148,34 @@ describe("parseSuppressions", () => {
     expect(rules).toHaveLength(2);
     expect(rules.every((r) => r.reason.length > 0 && r.expires && r.owner)).toBe(true);
   });
+
+  it("空清單是合法的：沒有規則，也不該報成一筆問題", () => {
+    expect(parseSuppressions("[]")).toEqual({ rules: [], problems: [] });
+    expect(parseSuppressions('{"suppressions":[]}')).toEqual({ rules: [], problems: [] });
+  });
+
+  // 呼叫端（annotate.ts）用 problem.rule?.id 組出 suppress.invalid-rule 的發現 id。
+  // 認不出規則時只能退回「第 N 筆」，而 N 會隨著清單被編輯而移動——同一個錯誤換了 id，
+  // 跨次比對就會報成「舊的修好了、又多一個新的」。所以壞規則也必須帶得回自己的 id。
+  it("認得出 id 的壞規則會帶回規則回音，問題的身分不隨它在清單裡的位置改變", () => {
+    const broken = { id: "headers.coop", expiry: "2026-09-01", reason: "打錯欄位名" };
+    const first = parseSuppressions(JSON.stringify([broken]));
+    const shifted = parseSuppressions(
+      JSON.stringify([{ id: "cookies.samesite.theme", reason: "主題偏好" }, broken]),
+    );
+    expect(first.problems[0]?.rule?.id).toBe("headers.coop");
+    expect(shifted.problems[0]?.rule?.id).toBe("headers.coop");
+  });
+
+  it("缺 reason 的規則也認得出 id，reason 明寫「未填寫」而不是留白讓人以為沒事", () => {
+    const { problems } = parseSuppressions('[{"id":"headers.server-version"}]');
+    expect(problems[0]?.rule).toEqual({ id: "headers.server-version", reason: "（未填寫）" });
+  });
+
+  it("連 id 都認不出來時 rule 就是 null，不硬掰一個身分出來", () => {
+    const { problems } = parseSuppressions('[{"reason":"忘了寫 id"},"整條都不是物件"]');
+    expect(problems.map((p) => p.rule)).toEqual([null, null]);
+  });
 });
 
 describe("matchesId 與 ruleMatches", () => {
@@ -195,6 +223,24 @@ describe("expiryInstant 與 isExpired", () => {
 
   it("看不懂的日期視同已過期，不可以變成永久抑制", () => {
     expect(isExpired(rule({ id: "x", expires: "下個月" }), NOW)).toBe(true);
+  });
+
+  // 空字串是「寫了但寫壞了」，不是「沒有寫」。若落到永久抑制那一側，
+  // 一個手滑清空的欄位就換到無限期的靜音，而且不會留下任何痕跡。
+  it("expires 是空字串等同寫壞了，視同已過期而不是永久抑制", () => {
+    expect(isExpired(rule({ id: "x", expires: "" }), NOW)).toBe(true);
+    expect(isExpired(rule({ id: "x", expires: "   " }), NOW)).toBe(true);
+  });
+
+  it("到期邊界精確到毫秒：當天最後一毫秒仍有效，再過 1 毫秒就失效", () => {
+    const lastMoment = new Date("2026-08-20T23:59:59.999Z");
+    expect(isExpired(rule({ id: "x", expires: "2026-08-20" }), lastMoment)).toBe(false);
+    expect(isExpired(rule({ id: "x", expires: "2026-08-20" }), new Date(lastMoment.getTime() + 1))).toBe(true);
+  });
+
+  it("帶時區的完整時間以該時刻為準，不會被補成當天結束", () => {
+    expect(expiryInstant("2026-08-20T09:00:00+08:00")).toBe(Date.parse("2026-08-20T01:00:00Z"));
+    expect(isExpired(rule({ id: "x", expires: "2026-08-20T09:00:00+08:00" }), NOW)).toBe(true);
   });
 });
 
@@ -359,6 +405,68 @@ describe("applySuppressions", () => {
     const second = applySuppressions(findings, rules, new Date(NOW.getTime() + 86_400_000));
     expect(ids(first.notes)).toEqual(ids(second.notes));
     expect(first.notes.map((n) => n.where)).toEqual(second.notes.map((n) => n.where));
+  });
+
+  // annotate.ts 靠物件同一性把留下的發現放回各自的 CheckResult
+  // （`const kept = new Set(outcome.kept)` 再逐一 filter）。這裡若複製一份新物件，
+  // 那個 filter 會一筆都對不上，整份報告的發現會被清空——而且不會有任何錯誤訊息。
+  it("回傳的是原本那些發現物件，不是複製品（呼叫端靠物件同一性把它們放回檢查結果）", () => {
+    const findings = [mk("headers.coop", "low"), mk("headers.nosniff")];
+    const out = applySuppressions(findings, [rule({ id: "headers.coop", expires: "2026-12-31" })], NOW);
+    expect(out.suppressed[0]?.finding).toBe(findings[0]);
+    expect(out.kept[0]).toBe(findings[1]);
+  });
+
+  // 三端掃同一個站時，同一處的同一個問題會由不同 surface 各回報一次：
+  // id 與 where 相同（穩定鍵相同），但物件不同，嚴重度也可能因端而異。
+  // 攔截若認物件、認領若認鍵，被擋下的那筆 critical 會從孿生物件的鍵溜進 suppressed——
+  // 一個沒有人看得見的假綠燈，正是抑制清單最不能犯的錯。
+  it("同一把鍵上的 critical 被攔下時，同鍵的其他回報也不會偷偷被蓋掉", () => {
+    const findings = [
+      mk("headers.hsts.missing", "critical", "https://a.test/"),
+      mk("headers.hsts.missing", "high", "https://a.test/"),
+    ];
+    const out = applySuppressions(findings, [rule({ id: "headers.*", expires: "2026-12-31" })], NOW);
+    expect(out.suppressed).toEqual([]);
+    expect(out.kept).toEqual(findings);
+    expect(out.notes.find((n) => n.id === "suppress.critical-requires-ack")?.severity).toBe("medium");
+  });
+
+  // 廣泛規則管一整個家族、另立一條具名規則承擔那筆 critical，是實務上正確的寫法。
+  // 此時廣泛規則的提醒若照發，報告會出現一句與事實相反的話（「該筆照常回報」但它其實被蓋住了），
+  // 那比不寫還糟：讀者會去主清單找一筆根本不在那裡的發現。
+  it("critical 已被另一條有 ack 的規則合法蓋住時，不留下與事實相反的提醒", () => {
+    const findings = [mk("cookies.httponly.sid", "critical"), mk("cookies.samesite.theme", "info")];
+    const out = applySuppressions(
+      findings,
+      [
+        rule({ id: "cookies.*", expires: "2026-12-31", reason: "整批已知取捨" }),
+        rule({ id: "cookies.httponly.sid", expires: "2026-12-31", acknowledgeCritical: true, owner: "sec@aios" }),
+      ],
+      NOW,
+    );
+    expect(out.kept).toEqual([]);
+    expect(out.suppressed.map((s) => s.rule.owner)).toEqual(["sec@aios", undefined]);
+    expect(ids(out.notes)).not.toContain("suppress.critical-requires-ack");
+  });
+
+  // 解析階段就會擋掉純 *，但 applySuppressions 是公開的純函式，規則也可能是別處手工組出來的。
+  // 判定本身必須自己站得住：任何一條「等於關掉檢測」的規則都不該有機會生效。
+  it("純 * 規則就算繞過解析直接送進來，也蓋不掉任何東西", () => {
+    const findings = [mk("headers.coop", "low"), mk("cookies.httponly.sid", "critical")];
+    const out = applySuppressions(findings, [{ id: "*", reason: "先讓 CI 過" }], NOW);
+    expect(out.kept).toEqual(findings);
+    expect(ids(out.notes)).toEqual(["suppress.stale"]);
+  });
+
+  it("不會改動傳入的發現與規則陣列——後續的報告與比對都還要用同一份資料", () => {
+    const findings = [mk("headers.coop", "low"), mk("cookies.httponly.sid", "critical")];
+    const rules = [rule({ id: "headers.*" })];
+    const findingsCopy = [...findings];
+    const rulesCopy = structuredClone(rules);
+    applySuppressions(findings, rules, NOW);
+    expect(findings).toEqual(findingsCopy);
+    expect(rules).toEqual(rulesCopy);
   });
 });
 
