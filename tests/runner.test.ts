@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { exitCodeFor, runChecks } from "../src/core/runner.js";
+import { exitCodeFor, perOrigin, perSurface, runChecks } from "../src/core/runner.js";
 import { finding } from "../src/core/findings.js";
 import { buildSurfaces } from "../src/core/surfaces.js";
 import type { CheckResult, RunReport, SentinelConfig, Severity } from "../src/core/types.js";
@@ -173,5 +173,50 @@ describe("exitCodeFor — --fail-on-new", () => {
   it("什麼都沒跑到仍然回 3，優先於新增判定", () => {
     const nothing = { ...withDiff({ added: [f("g", "critical")] }, "critical"), summary: { ...report().summary, completed: 0, total: 3, skipped: 3 } };
     expect(exitCodeFor(nothing, "high", { onlyNew: true })).toBe(3);
+  });
+});
+
+/**
+ * `perOrigin` 的語意測試。
+ *
+ * 這個輔助函式存在的理由是「憑證不會因為 UA 而不同」。寫錯的兩種方式都有代價：
+ * 退化成 perSurface 會讓同一份判定重複三次並讓請求量變成三倍；
+ * 寫死成「只跑 web」則會在三端各指不同部署時漏驗另外兩個站。
+ */
+describe("perOrigin", () => {
+  const task = async () => result();
+
+  it("三端同源時只展開一項，且標為 all（那筆發現不屬於任何單一載體）", () => {
+    const planned = perOrigin(buildSurfaces("https://example.test"), "tls", "security", () => task);
+    expect(planned).toHaveLength(1);
+    expect(planned[0]?.surface).toBe("all");
+  });
+
+  it("三端各指不同部署時每個 origin 都要驗——不能只驗 web", () => {
+    const surfaces = buildSurfaces("https://example.test", {
+      app: "https://app.example.test",
+      desktop: "https://desktop.example.test",
+    });
+    const planned = perOrigin(surfaces, "tls", "security", () => task);
+    expect(planned).toHaveLength(3);
+    expect(planned.map((p) => p.surface).sort()).toEqual(["app", "desktop", "web"]);
+  });
+
+  it("兩端同源、一端另指時，同源那組標 all，獨立那端標自己", () => {
+    const surfaces = buildSurfaces("https://example.test", { desktop: "https://desktop.example.test" });
+    const planned = perOrigin(surfaces, "tls", "security", () => task);
+    expect(planned).toHaveLength(2);
+    expect(planned[0]?.surface).toBe("all");
+    expect(planned[1]?.surface).toBe("desktop");
+  });
+
+  it("與 perSurface 的差別：同源時 perSurface 仍展開三項", () => {
+    const surfaces = buildSurfaces("https://example.test");
+    expect(perSurface(surfaces, "transport", "security", () => task)).toHaveLength(3);
+    expect(perOrigin(surfaces, "tls", "security", () => task)).toHaveLength(1);
+  });
+
+  it("沒有可連的端時回空陣列，不會憑空產生一項", () => {
+    expect(perOrigin([], "tls", "security", () => task)).toEqual([]);
   });
 });

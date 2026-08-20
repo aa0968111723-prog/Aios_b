@@ -101,6 +101,38 @@ export function perSurface(
 }
 
 /**
+ * 每個**不同的 origin** 只跑一次的檢查。
+ *
+ * 有一類判定與載體完全無關：TLS 憑證、robots.txt、開放重導向、方法稽核——
+ * 伺服器不會因為請求帶著 App 的 UA 就換一張憑證。這些檢查若照 surface 展開，
+ * 三端同源時只會得到三份一模一樣的發現，並讓請求量無謂地變成三倍；
+ * 而這套系統的原則之一正是「檢測系統不該污染它要測量的東西」。
+ *
+ * 但也不能寫死成「只跑 web」：三端可以各自指到不同部署（`AIOS_APP_TARGET` 等），
+ * 那時候每個 origin 都必須各驗一次。所以判準是 origin 而不是 surface。
+ */
+export function perOrigin(
+  surfaces: Surface[],
+  name: string,
+  category: CheckResult["category"],
+  build: (surface: Surface) => CheckTask,
+): PlannedCheck[] {
+  const byOrigin = new Map<string, Surface[]>();
+  for (const surface of surfaces) {
+    const group = byOrigin.get(surface.origin) ?? [];
+    group.push(surface);
+    byOrigin.set(surface.origin, group);
+  }
+
+  return [...byOrigin.values()].map((group) => {
+    const representative = group[0] as Surface;
+    // 一個 origin 底下有多個 surface 時，這筆發現不屬於任何單一載體——標 all 才誠實。
+    const surface: CheckResult["surface"] = group.length > 1 ? "all" : representative.id;
+    return { name, category, surface, run: build(representative) };
+  });
+}
+
+/**
  * 結束碼。
  *   0 通過　1 發現達門檻的問題　2 檢查器自身出錯　3 什麼都沒實際執行
  *
