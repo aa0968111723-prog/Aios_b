@@ -319,14 +319,18 @@ async function planScan(config: SentinelConfig, options: ScanOptions): Promise<P
     ),
   );
 
-  if (reachable.length > 0) {
-    checks.push({
-      name: "build-drift",
-      category: "integrity",
-      surface: "all",
-      run: () => checkBuildDrift(reachable, timeoutMs),
-    });
-  }
+  // 一端都連不到時 build-drift 也要留一筆「跳過」。整項從報告上消失的話，
+  // 讀者掃過檢查清單只會覺得少了一項，而不會知道版本一致性這一輪根本沒驗。
+  checks.push(
+    reachable.length > 0
+      ? {
+          name: "build-drift",
+          category: "integrity",
+          surface: "all",
+          run: () => checkBuildDrift(reachable, timeoutMs),
+        }
+      : skipped("build-drift", "integrity", "all", "沒有任何一端可連，無從比對版本。"),
+  );
 
   return checks;
 }
@@ -353,14 +357,16 @@ async function planMonitor(config: SentinelConfig, filter: CheckFilter): Promise
     ...perSurface(reachable, "db-traffic", "monitoring", (s) => () => checkDbTraffic(s, repoPath, timeoutMs)),
   );
 
-  if (reachable.length > 0) {
-    checks.push({
-      name: "device",
-      category: "monitoring",
-      surface: "all",
-      run: () => checkDevice(reachable, timeoutMs),
-    });
-  }
+  checks.push(
+    reachable.length > 0
+      ? {
+          name: "device",
+          category: "monitoring",
+          surface: "all",
+          run: () => checkDevice(reachable, timeoutMs),
+        }
+      : skipped("device", "monitoring", "all", "沒有任何一端可連，無法建立裝置紀錄。"),
+  );
 
   return checks;
 }

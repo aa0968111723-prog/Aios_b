@@ -189,6 +189,14 @@ describe("CLI --only 端到端", () => {
     expect(notRun.every((r) => (r.skippedReason ?? "").includes("未執行不等於通過"))).toBe(true);
   }, 120_000);
 
+  it("一端都連不到時，build-drift 仍以「跳過」留在報告上", async () => {
+    const run = await runCli(["scan", "--target", "http://127.0.0.1:1", "--surfaces", "web"]);
+    const drift = resultFor(run.report, "build-drift");
+    expect(drift).toBeDefined();
+    expect(drift?.completed).toBe(false);
+    expect(drift?.skippedReason ?? "").toContain("無從比對版本");
+  }, 120_000);
+
   it("被篩掉的檢查留在報告上（跳過＋原因），不是憑空消失", async () => {
     const run = await runCli(["scan", "--target", origin, "--surfaces", "web", "--only", "health"]);
     const health = resultFor(run.report, "health");
