@@ -251,3 +251,78 @@ describe("classifyWellKnownFile", () => {
     expect(state.state).toBe("unverified");
   });
 });
+
+/**
+ * robots.txt 的敏感路徑判定。
+ *
+ * 這條規則的風險是兩面的：太鬆會把 `/administration-guide` 這種無害路徑報成敏感，
+ * 太緊則會漏掉真正把後台位址公告出去的那一筆。所以比對用的是詞邊界而不是子字串。
+ */
+describe("findSensitiveDisallows", () => {
+  const keywords = (paths: string[]) => findSensitiveDisallows(paths).map((h) => h.keyword);
+
+  it("抓得到公告出去的後台與內部路徑", () => {
+    expect(keywords(["/admin-panel", "/internal/tools", "/backup/2026"])).toEqual(["admin", "internal", "backup"]);
+  });
+
+  it("點檔名也算——那是最不該被寫進公開檔案的一種", () => {
+    expect(keywords(["/.env", "/.git/"])).toEqual([".env", ".git"]);
+  });
+
+  it("複數形照樣命中", () => {
+    expect(keywords(["/backups/"])).toEqual(["backup"]);
+  });
+
+  it("一般路徑不誤中——關鍵字只是別的字的一部分時不算", () => {
+    expect(findSensitiveDisallows(["/administration-guide", "/configurator", "/products", "/secretary"])).toEqual([]);
+  });
+
+  it("同一條路徑只算一個關鍵字，不會重複報同一筆", () => {
+    expect(findSensitiveDisallows(["/admin/config"])).toHaveLength(1);
+  });
+
+  it("空清單不會爆", () => {
+    expect(findSensitiveDisallows([])).toEqual([]);
+  });
+});
+
+/**
+ * 取檔結果的分類。
+ *
+ * 三種答案必須分得開：**有這份檔案**、**確定沒有**、**沒測到**。
+ * 把第三種講成前兩種的任何一種，都是這個專案最反對的那類錯誤結論。
+ */
+describe("classifyWellKnownFile", () => {
+  const SPA = '<!doctype html><html><body><div id="root"></div></body></html>';
+
+  it("200 加真實內容＝有這份檔案", () => {
+    const out = classifyWellKnownFile({ status: 200, body: "User-agent: *\n", contentType: "text/plain" });
+    expect(out.state).toBe("present");
+  });
+
+  it("SPA 兜底頁不是「有這份檔案」，是「這個站沒有這份檔案」", () => {
+    const out = classifyWellKnownFile({ status: 200, body: SPA, contentType: "text/html" });
+    expect(out.state).toBe("absent");
+    expect(out.state === "absent" && out.reason).toContain("SPA 兜底");
+  });
+
+  it.each([404, 410])("HTTP %i 是伺服器對「有沒有這份檔案」最明確的否定答覆", (status) => {
+    expect(classifyWellKnownFile({ status, body: "Not Found", contentType: "text/plain" }).state).toBe("absent");
+  });
+
+  it("404 要先於中介層判定——否則每個正常的 404 都會被講成「沒測到」", () => {
+    // 這個 404 的內容不像應用回應，剛好會命中攔截啟發式；順序寫反時它會變成 unverified。
+    expect(classifyWellKnownFile({ status: 404, body: "nginx", contentType: "text/plain" }).state).toBe("absent");
+  });
+
+  it("被中介層攔截時是「沒測到」，不是「沒有這份檔案」", () => {
+    const out = classifyWellKnownFile({ status: 403, body: "Blocked by WAF", contentType: "text/plain" });
+    expect(out.state).toBe("unverified");
+  });
+
+  it("其他非 200 狀態一律「沒測到」", () => {
+    expect(classifyWellKnownFile({ status: 500, body: '{"error":"boom"}', contentType: "application/json" }).state).toBe(
+      "unverified",
+    );
+  });
+});

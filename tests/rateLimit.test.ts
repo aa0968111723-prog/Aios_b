@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { analyzeRateLimit, DEFAULT_ATTEMPTS, type RateLimitSample } from "../src/detectors/rateLimit.js";
+import {
+  analyzeRateLimit,
+  DEFAULT_ATTEMPTS,
+  looksLikeBackoff,
+  looksLikeLoginEndpoint,
+  readRateLimitRemaining,
+  type RateLimitSample,
+} from "../src/detectors/rateLimit.js";
 
 const ctx = { surface: "web" as const, where: "https://example.test/api/auth/login", attempts: DEFAULT_ATTEMPTS };
 const ids = (findings: ReturnType<typeof analyzeRateLimit>) => findings.map((f) => f.id);
@@ -202,5 +209,116 @@ describe("analyzeRateLimit：發現的形狀", () => {
       expect(f.category).toBe("security");
       expect(f.surface).toBe("web");
     }
+  });
+});
+
+/**
+ * 登入端點判定。
+ *
+ * 這是本檢查最關鍵、也最容易兩邊都判錯的一個決定：
+ * 判成「不是登入端點」會讓整項靜靜跳過（一份看起來無害的報告，其實什麼都沒測）；
+ * 判成「是」則會把中介層的封鎖頁當成登入失敗，最後報出一筆不存在的 high。
+ */
+describe("looksLikeLoginEndpoint", () => {
+  const res = (over: Partial<{ status: number; body: string; contentType: string }>) => ({
+    status: 401,
+    body: "",
+    contentType: "application/json",
+    ...over,
+  });
+
+  it("空 body 的 401 是最標準的登入失敗——不能被攔截啟發式吃掉", () => {
+    expect(looksLikeLoginEndpoint(res({ status: 401, body: "" }))).toBe(true);
+  });
+
+  it("只有訊息、沒有 error/ok/code 欄位的 401 也算", () => {
+    expect(looksLikeLoginEndpoint(res({ status: 401, body: '{"message":"帳號或密碼錯誤"}' }))).toBe(true);
+  });
+
+  it.each([400, 422])("HTTP %i 一定是應用回的，直接採信", (status) => {
+    expect(looksLikeLoginEndpoint(res({ status }))).toBe(true);
+  });
+
+  it.each([404, 405, 501])("HTTP %i 代表這個位址上沒掛登入", (status) => {
+    expect(looksLikeLoginEndpoint(res({ status }))).toBe(false);
+  });
+
+  it("SPA 兜底頁代表「這裡什麼都沒有」", () => {
+    const spa = '<!doctype html><html><body><div id="root"></div></body></html>';
+    expect(looksLikeLoginEndpoint(res({ status: 200, body: spa, contentType: "text/html" }))).toBe(false);
+  });
+
+  it("403 曖昧：內容像應用回應才採信", () => {
+    expect(looksLikeLoginEndpoint(res({ status: 403, body: '{"error":"invalid credentials"}' }))).toBe(true);
+  });
+
+  it("403 的 WAF 封鎖頁不算——把它收進樣本，會讓連續封鎖被報成「沒有速率限制」", () => {
+    expect(looksLikeLoginEndpoint(res({ status: 403, body: "Forbidden", contentType: "text/plain" }))).toBe(false);
+  });
+});
+
+/**
+ * 速率限制標頭的判讀。
+ *
+ * 少認 draft-7／8 的合併寫法，代價是一個有防護、門檻又設得比本輪次數高的站台
+ * 會完全看不到限制器的痕跡，於是被報成 `absent`（high）。
+ */
+describe("readRateLimitRemaining", () => {
+  const from = (headers: Record<string, string>) => (name: string) => headers[name] ?? null;
+
+  it("認得 IETF draft-6 的 RateLimit-Remaining", () => {
+    expect(readRateLimitRemaining(from({ "ratelimit-remaining": "3" }))).toBe("3");
+  });
+
+  it("認得舊慣例的 X-RateLimit-Remaining", () => {
+    expect(readRateLimitRemaining(from({ "x-ratelimit-remaining": "0" }))).toBe("0");
+  });
+
+  it("認得 draft-7／8 把三個值併成一行的寫法", () => {
+    expect(readRateLimitRemaining(from({ ratelimit: "limit=5, remaining=3, reset=60" }))).toBe("3");
+  });
+
+  it("空字串等同沒有——把空標頭當成證據會憑空生出一筆正面觀測", () => {
+    expect(readRateLimitRemaining(from({ "ratelimit-remaining": "   " }))).toBeNull();
+  });
+
+  it("完全沒有這類標頭時回 null", () => {
+    expect(readRateLimitRemaining(from({}))).toBeNull();
+  });
+
+  it("合併寫法裡的 limit 不會被誤讀成 remaining", () => {
+    expect(readRateLimitRemaining(from({ ratelimit: "limit=5" }))).toBeNull();
+  });
+});
+
+/**
+ * 指數退避的判定。
+ *
+ * 退避是速率限制的另一種樣貌（不回 429，改成越試越慢）。判太鬆會把網路抖動講成防護，
+ * 於是一個完全沒設限的登入端點被判成安全——那是這裡最該避免的方向。
+ */
+describe("looksLikeBackoff", () => {
+  it("樣本太少不判定——兩次之間的差異解釋不了任何事", () => {
+    expect(looksLikeBackoff([100, 900])).toBe(false);
+  });
+
+  it("穩定遞增且總幅度夠大時判為有退避", () => {
+    expect(looksLikeBackoff([100, 400, 1200])).toBe(true);
+  });
+
+  it("平坦的回應時間不是退避", () => {
+    expect(looksLikeBackoff([120, 118, 125, 122])).toBe(false);
+  });
+
+  it("倍率夠但絕對差距太小時不算——那只是網路抖動", () => {
+    expect(looksLikeBackoff([10, 20, 40])).toBe(false);
+  });
+
+  it("只有最後一次暴衝、中間沒有遞增趨勢時不算", () => {
+    expect(looksLikeBackoff([100, 90, 95, 100, 3000])).toBe(false);
+  });
+
+  it("空陣列不會爆", () => {
+    expect(looksLikeBackoff([])).toBe(false);
   });
 });
