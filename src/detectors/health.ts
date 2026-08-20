@@ -24,6 +24,42 @@ interface ReadyComponent {
   note?: string;
 }
 
+/**
+ * 一個就緒分項的狀態。
+ *
+ * 「無法判定」必須與「通過」和「故障」並列成第三種答案。舊版把
+ * 「形狀不是 `{ok: true}`」一律當成故障，於是一個回 `{"db":"ok"}`（分項用字串狀態，
+ * 同一份型別宣告自己就允許這種寫法）的健康站台，會被報成 db／boot／storage 全部掛掉——
+ * 一次五筆 critical／high，全部是假的。
+ */
+export type ComponentState = "ok" | "failed" | "unknown";
+
+/** 這些字串在各家健康檢查慣例裡都代表通過。`skipped`／`disabled` 也算——ai_os 的 web 角色不跑 runner。 */
+const PASS_WORDS = /^(ok|up|pass(ed)?|healthy|ready|skipped|disabled|not[-_ ]?applicable|n\/a)$/i;
+const FAIL_WORDS = /^(fail(ed|ing)?|down|error|unhealthy|degraded|unavailable)$/i;
+
+/**
+ * 判讀分項狀態。
+ *
+ * 認得三種寫法：布林、狀態字串、以及 `{ ok: boolean }` 物件。認不得的一律回 `unknown`——
+ * 猜錯的方向無論哪一邊都有代價，所以不猜。
+ */
+export function componentState(value: unknown): ComponentState {
+  if (value === true) return "ok";
+  if (value === false) return "failed";
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (PASS_WORDS.test(text)) return "ok";
+    if (FAIL_WORDS.test(text)) return "failed";
+    return "unknown";
+  }
+  if (value !== null && typeof value === "object") {
+    const ok = (value as { ok?: unknown }).ok;
+    return ok === undefined ? "unknown" : componentState(ok);
+  }
+  return "unknown";
+}
+
 interface ReadyPayload {
   ok?: boolean;
   processRole?: string;
@@ -182,11 +218,16 @@ export async function checkHealth(surface: Surface, timeoutMs: number): Promise<
   }
 
   const components = readyBody.components ?? {};
-  facts.components = Object.fromEntries(Object.entries(components).map(([k, v]) => [k, v?.ok ?? null]));
+  facts.components = Object.fromEntries(Object.entries(components).map(([k, v]) => [k, componentState(v)]));
 
+  const unknownComponents: string[] = [];
   for (const [name, comp] of Object.entries(components)) {
-    if (comp?.ok === true) continue;
-    // ai_os 的 runner 分項在 web 角色會回 skipped 且 ok:true，所以能走到這裡的都是真的不 ok。
+    const state = componentState(comp);
+    if (state === "ok") continue;
+    if (state === "unknown") {
+      unknownComponents.push(name);
+      continue;
+    }
     const severity = COMPONENT_SEVERITY[name] ?? "medium";
     findings.push(
       finding({
@@ -210,19 +251,59 @@ export async function checkHealth(surface: Surface, timeoutMs: number): Promise<
     );
   }
 
-  if (ready.status === 503 && findings.every((f) => !f.id.startsWith("ready.component"))) {
-    // 整體 503 但每個分項都自稱 ok：這是 ai_os 端的判定不一致，值得單獨報。
+  if (unknownComponents.length > 0) {
     findings.push(
       finding({
         ...base,
-        id: "ready.inconsistent",
-        severity: "medium",
-        title: `${surface.label}：整體回報未就緒，但所有分項都是通過`,
-        detail: "503 與分項狀態互相矛盾，代表就緒判定裡有分項沒被列進 components，故障點看不見。",
-        remediation: "檢查 /api/ready 的 ok 計算是否涵蓋所有納入判定的分項。",
-        evidence: ready.body.slice(0, 400),
+        id: "ready.component-shape",
+        severity: "low",
+        title: `${surface.label}：${unknownComponents.length} 個就緒分項的狀態判讀不出來`,
+        detail:
+          `分項 ${unknownComponents.join("、")} 的回應形狀不是本工具認得的（布林、狀態字串、或 { ok: boolean }）。` +
+          "這些分項**本輪沒有被判定**——既沒說它們有問題，也不代表它們沒問題。",
+        remediation: "把 /api/ready 的分項統一成 { ok: boolean, note?: string }，或告知本工具實際使用的格式。",
+        evidence: ready.body.slice(0, 300),
         where: readyUrl,
       }),
+    );
+  }
+
+  // ── 整體就緒狀態 ────────────────────────────────────────────────────────
+  //
+  // 這一段過去完全不存在，於是 /api/ready 回 HTTP 500 加 {"ok":false,"error":"db pool exhausted"}
+  // （沒有 components 欄位）時，整個檢查回報零發現、標記完成，終端印出「✓ 沒有發現問題」——
+  // 而站台此刻根本不能服務。這是這套系統最不能接受的一種輸出。
+  //
+  // 分項已經解釋了故障時就不重複報：讀者要的是故障點，不是再一句「總之沒就緒」。
+  const readyOk = ready.status === 200 && readyBody.ok === true;
+  const explainedByComponents = findings.some((f) => f.id.startsWith("ready.component."));
+
+  if (!readyOk && !explainedByComponents) {
+    const hasComponents = Object.keys(components).length > 0;
+    findings.push(
+      hasComponents
+        ? finding({
+            ...base,
+            id: "ready.inconsistent",
+            severity: "medium",
+            title: `${surface.label}：整體回報未就緒，但所有分項都是通過`,
+            detail: "整體狀態與分項互相矛盾，代表就緒判定裡有分項沒被列進 components，故障點看不見。",
+            remediation: "檢查 /api/ready 的 ok 計算是否涵蓋所有納入判定的分項。",
+            evidence: ready.body.slice(0, 400),
+            where: readyUrl,
+          })
+        : finding({
+            ...base,
+            id: "ready.not-ok",
+            severity: "high",
+            title: `${surface.label}：就緒端點回報未就緒（HTTP ${ready.status}）`,
+            detail:
+              "站台自己說它還不能服務，而回應裡沒有附上分項，所以看不出是哪一塊壞了。" +
+              "使用者此刻多半正在撞上錯誤畫面。",
+            remediation: "查應用日誌找出未就緒的原因；並讓 /api/ready 回傳 components 分項，故障點才看得見。",
+            evidence: ready.body.slice(0, 400),
+            where: readyUrl,
+          }),
     );
   }
 

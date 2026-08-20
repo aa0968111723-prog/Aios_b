@@ -4,9 +4,12 @@ import {
   analyzeManifest,
   analyzeShellTargets,
   analyzeTauri,
+  classifyCapabilityScope,
   parseAndroidManifest,
+  parseCapabilityFile,
   parseCapacitorConfig,
   parseTauriConfig,
+  stripJsComments,
 } from "../src/detectors/shellAudit.js";
 
 const WHERE = "capacitor.config.ts";
@@ -197,5 +200,129 @@ describe("analyzeShellTargets", () => {
 
   it("網址無法解析時安靜略過，不讓整項檢查爆掉", () => {
     expect(analyzeShellTargets({ target: "not-a-url", capacitorUrl: "x", tauriUrls: [], deepLinkHosts: [] })).toEqual([]);
+  });
+});
+
+/**
+ * 以下這組全部來自同一類缺陷：**解析器把「沒生效的設定」當成生效的**。
+ *
+ * 它們的共同症狀是假警報——一份完全正常的專案被報出三四筆 critical。
+ * 而假警報的代價比漏報更高：讀者第一次發現報告在說謊之後，就不會再讀第二份了。
+ */
+describe("設定解析：註解與引號", () => {
+  it("剝除區塊註解與整行行註解，但不切斷 https:// 的雙斜線", () => {
+    const cleaned = stripJsComments(`
+      /* 舊設定
+      url: "http://old.test",
+      */
+      // url: "http://192.168.1.10:5173",
+      url: "https://ai-os-app.zeabur.app",
+    `);
+    expect(cleaned).not.toContain("old.test");
+    expect(cleaned).not.toContain("192.168.1.10");
+    expect(cleaned).toContain("https://ai-os-app.zeabur.app");
+  });
+
+  it("被註解掉的本機開發設定不會被當成正式設定（最常見的假警報來源）", () => {
+    const facts = parseCapacitorConfig(`
+      const config: CapacitorConfig = {
+        server: {
+          // 本機開發時再打開這兩行
+          // url: "http://192.168.1.10:5173",
+          // cleartext: true,
+          url: "https://ai-os-app.zeabur.app",
+          androidScheme: "https",
+        },
+      };
+    `);
+    expect(facts.serverUrl).toBe("https://ai-os-app.zeabur.app");
+    expect(facts.cleartext).toBe(false);
+    expect(analyzeCapacitor(facts, WHERE).filter((f) => f.severity !== "info")).toEqual([]);
+  });
+
+  it("只在 server 區塊裡找 url——別的區塊的 url 不是 App 實際載入的網址", () => {
+    const facts = parseCapacitorConfig(`
+      const config = {
+        plugins: { SomePlugin: { url: "http://plugin.example" } },
+        server: { url: "https://ai-os-app.zeabur.app", androidScheme: "https" },
+      };
+    `);
+    expect(facts.serverUrl).toBe("https://ai-os-app.zeabur.app");
+  });
+
+  it("XML 註解裡的權限不算數", () => {
+    const facts = parseAndroidManifest(`
+      <manifest>
+        <uses-permission android:name="android.permission.INTERNET" />
+        <!-- 之後若要做相機上傳再打開
+        <uses-permission android:name="android.permission.CAMERA" />
+        -->
+      </manifest>
+    `);
+    expect(facts.permissions).toEqual(["android.permission.INTERNET"]);
+    expect(ids(analyzeManifest(facts, "m"))).not.toContain("shell.android.permissions");
+  });
+
+  it("單引號屬性是合法 XML，不能因此整組靜默漏判", () => {
+    const facts = parseAndroidManifest(
+      `<manifest><application android:debuggable='true' android:usesCleartextTraffic='true' android:allowBackup='true' /></manifest>`,
+    );
+    expect(facts.debuggable).toBe(true);
+    expect(facts.cleartextTraffic).toBe(true);
+    expect(facts.allowBackup).toBe(true);
+    expect(ids(analyzeManifest(facts, "m"))).toContain("shell.android.debuggable");
+  });
+
+  it("完全讀不懂的 manifest 會說出來，而不是回報零發現", () => {
+    const facts = parseAndroidManifest("<!doctype html><html><body>404</body></html>");
+    expect(facts.looksParseable).toBe(false);
+    const findings = analyzeManifest(facts, "m");
+    expect(ids(findings)).toEqual(["shell.android.unparseable"]);
+    expect(findings[0]?.detail).toContain("沒有發現不等於沒有問題");
+  });
+});
+
+describe("classifyCapabilityScope", () => {
+  it.each(["*", "https://*", "http://*/", "https://*/anything", "https://*.*"])("%s 是對整個網際網路開放", (url) => {
+    expect(classifyCapabilityScope(url)).toBe("whole-web");
+  });
+
+  it("綁在具體註冊網域上的子網域萬用不是全開——報成 critical 會讓人把整組告警關掉", () => {
+    expect(classifyCapabilityScope("https://*.aios-internal.com/*")).toBe("subdomain-wildcard");
+  });
+
+  it("host 寫死、只有路徑用萬用是正常寫法", () => {
+    expect(classifyCapabilityScope("https://ai-os-app.zeabur.app/*")).toBe("specific");
+  });
+
+  it("三種範圍在 analyzeTauri 產生不同的嚴重度", () => {
+    const conf = parseTauriConfig('{"app":{"security":{"csp":"default-src \'self\'"},"windows":[{"url":"https://a.test"}]}}')!;
+    const whole = analyzeTauri(conf, [{ identifier: "w", remote: { urls: ["https://*"] } }], "t");
+    const sub = analyzeTauri(conf, [{ identifier: "s", remote: { urls: ["https://*.a.test/*"] } }], "t");
+    const specific = analyzeTauri(conf, [{ identifier: "p", remote: { urls: ["https://a.test/*"] } }], "t");
+    expect(whole.find((f) => f.id.startsWith("shell.tauri.capability-wildcard"))?.severity).toBe("critical");
+    expect(sub.find((f) => f.id.startsWith("shell.tauri.capability-subdomain"))?.severity).toBe("medium");
+    expect(ids(specific).some((id) => id.startsWith("shell.tauri.capability-"))).toBe(false);
+  });
+});
+
+describe("parseCapabilityFile", () => {
+  it("單一物件與陣列兩種形狀都吃", () => {
+    expect(parseCapabilityFile('{"identifier":"a"}')).toHaveLength(1);
+    expect(parseCapabilityFile('[{"identifier":"a"},{"identifier":"b"}]')).toHaveLength(2);
+  });
+
+  it("帶註解與尾逗號的 JSON5 也解得出來（Tauri v2 官方支援）", () => {
+    const parsed = parseCapabilityFile(`{
+      // 遠端能力
+      "identifier": "remote-main",
+      "remote": { "urls": ["https://a.test/*"], },
+    }`);
+    expect(parsed?.[0]?.identifier).toBe("remote-main");
+  });
+
+  it("真的壞掉時回 null，讓呼叫端把「沒稽核到」講出來", () => {
+    expect(parseCapabilityFile("這不是 JSON")).toBeNull();
+    expect(parseCapabilityFile("null")).toBeNull();
   });
 });
