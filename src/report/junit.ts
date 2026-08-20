@@ -41,6 +41,19 @@ export function escapeXml(text: string): string {
     .replace(/'/g, "&apos;");
 }
 
+/**
+ * 屬性值專用的跳脫：在 `escapeXml` 之上，再把 tab／換行／歸位換成字元參照。
+ *
+ * 這三個字元在屬性裡是合法的，問題在於 XML 規定解析器讀屬性值時要把它們**正規化成空白**。
+ * 於是一段多行的執行錯誤（`SyntaxError: …\n    at …`）寫進 `message` 後，面板上收到的是
+ * 被壓成一行、看不出層次的字串——資料還在，但堆疊的形狀沒了。寫成 `&#10;` 就不受正規化影響，
+ * 讀者拿到的與檢查器當初記下的是同一段文字。文字節點沒有這個問題，所以那邊仍然用 `escapeXml`，
+ * 讓原始檔本身保持人眼可讀。
+ */
+function escapeAttr(text: string): string {
+  return escapeXml(text).replace(/\t/g, "&#9;").replace(/\n/g, "&#10;").replace(/\r/g, "&#13;");
+}
+
 /** 一筆 testcase。kind 決定它在面板上是紅的、灰的還是綠的——這個對應關係就是本模組的重點。 */
 interface Testcase {
   name: string;
@@ -52,6 +65,8 @@ interface Testcase {
   type?: string;
   /** 元素內文：failure／error 放完整說明，通過的項目放 system-out。 */
   body?: string;
+  /** 這一筆講的是哪一處。同名 testcase 撞在一起時，用它把兩者分開（見 `withUniqueNames`）。 */
+  where?: string;
 }
 
 interface Testsuite {
@@ -62,8 +77,15 @@ interface Testsuite {
   cases: Testcase[];
 }
 
+/**
+ * 秒數。非有限值一律當 0。
+ *
+ * `time` 在 JUnit 的 schema 裡是數字，而 `NaN`／`Infinity` 印出來就是那幾個字母——
+ * 嚴格一點的消費端（Jenkins 會拿 XSD 驗）會因此拒收整份檔案，於是所有結果一起消失。
+ * 耗時只是輔助資訊，為了它賠上整份報告不划算，寧可顯示 0。
+ */
 function seconds(ms: number): string {
-  return (Math.max(0, ms) / 1000).toFixed(3);
+  return (Number.isFinite(ms) ? Math.max(0, ms) / 1000 : 0).toFixed(3);
 }
 
 function count(cases: Testcase[], kind: Testcase["kind"]): number {
@@ -71,8 +93,17 @@ function count(cases: Testcase[], kind: Testcase["kind"]): number {
 }
 
 /** 證據可能是整份回應標頭；不截斷的話一份報告會膨脹到沒有人願意打開。 */
+const EVIDENCE_LIMIT = 1200;
+
 function clipEvidence(evidence: string): string {
-  return evidence.length > 1200 ? `${evidence.slice(0, 1200)}…（證據已截斷）` : evidence;
+  if (evidence.length <= EVIDENCE_LIMIT) return evidence;
+  // JavaScript 的字串以 UTF-16 計長，而表情符號與部分 CJK 擴充字佔兩個單位。
+  // 剛好切在中間會留下半個代理對——那不是合法字元，寫進檔案時會變成一個問號方塊，
+  // 而讀者會以為是站台真的回了亂碼。少留一個字元，比留下一段假的觀測值好。
+  const head = evidence.charCodeAt(EVIDENCE_LIMIT - 1) >= 0xd800 && evidence.charCodeAt(EVIDENCE_LIMIT - 1) <= 0xdbff
+    ? EVIDENCE_LIMIT - 1
+    : EVIDENCE_LIMIT;
+  return `${evidence.slice(0, head)}…（證據已截斷）`;
 }
 
 /**
@@ -91,7 +122,7 @@ function casesForResult(r: CheckResult, failOn: Severity): Testcase[] {
   const classname = `aios-sentinel.${r.category}`;
 
   const cases: Testcase[] = r.findings.map((f): Testcase => {
-    const base = { name: f.id, classname: `aios-sentinel.${f.category}` };
+    const base = { name: f.id, classname: `aios-sentinel.${f.category}`, where: f.where };
     // 達門檻的才算 failure。門檻以下的發現仍然要看得見，但不該讓建置變紅——
     // 一個因為 info 級提示天天紅燈的面板，最後會被整組關掉，連 critical 都沒人看。
     if (severityRank(f.severity) <= severityRank(failOn)) {
@@ -106,7 +137,9 @@ function casesForResult(r: CheckResult, failOn: Severity): Testcase[] {
       classname,
       kind: "error",
       message: r.error,
-      body: "檢查器本身沒有跑完，這一項在本次執行中沒有任何結論——不是通過。",
+      // 錯誤原文在 message 與內文各放一次：JUnit 的慣例是內文擺堆疊，而不同面板顯示的位置不一樣
+      // （有的只列 message，有的只在展開時給內文）。診斷檢測器故障靠的就是這段原文，不能賭它會被顯示。
+      body: `檢查器本身沒有跑完，這一項在本次執行中沒有任何結論——不是通過。\n${r.error}`,
     });
   } else if (!r.completed) {
     // 沒填 skippedReason 的未完成檢查也要落在 skipped：不能因為少一段文字就被當成通過。
@@ -141,6 +174,7 @@ function suppressedSuite(report: RunReport): Testsuite[] {
         (s): Testcase => ({
           name: s.finding.id,
           classname: `aios-sentinel.${s.finding.category}`,
+          where: s.finding.where,
           kind: "skipped",
           message: `依抑制清單移出主清單：${s.reason}（到期：${s.expires ?? "永久"}）。問題本身仍然存在。`,
         }),
@@ -178,15 +212,69 @@ function coverageSuite(report: RunReport): Testsuite[] {
   ];
 }
 
+/**
+ * 一份 testcase 全空的報告。
+ *
+ * `tests="0"` 在每一個面板上都是綠的：沒有失敗、沒有跳過、沒有任何字提醒讀者這裡是空的，
+ * 看起來就跟一輪順利跑完的檢測一模一樣。而它真正的意思是「這一輪連一項結果都沒有記錄下來」
+ * ——過濾條件把全部檢查都排掉、或編排根本沒跑起來。CLI 那邊這種執行會以結束碼 3 收場，
+ * 但面板讀的是這個檔案，不是結束碼，所以這裡必須自己講出來。
+ */
+function emptyRunSuite(report: RunReport): Testsuite {
+  return {
+    name: "沒有任何檢查被執行",
+    classname: "aios-sentinel.coverage",
+    durationMs: 0,
+    properties: [["target", report.target]],
+    cases: [
+      {
+        name: "本次執行沒有任何檢查結果",
+        classname: "aios-sentinel.coverage",
+        kind: "skipped",
+        message:
+          "這份報告裡一項檢查結果都沒有——不是全部通過，是什麼都沒測。" +
+          "請確認執行參數（--only／--skip 是否把所有檢查都排除了）與檢測器有沒有真的啟動。",
+      },
+    ],
+  };
+}
+
+/**
+ * 讓同一個 testsuite 裡的 testcase 身分唯一。
+ *
+ * 同一種問題出現在多個位置時，`id` 會重複而 `where` 不同——`findingKey` 用 id 加 where 當鍵，
+ * 就是承認這件事會發生。但 JUnit 的消費端（Jenkins、GitLab、GitHub Actions 的測試摘要）
+ * 一律以 classname 加 name 當測試的主鍵，同名的兩筆會被折成一筆：兩個 failure 在面板上只剩一個，
+ * 而少掉的那個不會有任何提示，讀者會以為問題只有一處。
+ *
+ * 撞名時才補位置，沒撞就維持純 id——名稱是讀者跨次執行辨認同一項的依據，能不動就不動。
+ * 連位置都一樣（同一處的兩筆同 id 發現）時再補序號，確保最後一定分得開。
+ */
+function withUniqueNames(cases: Testcase[]): Testcase[] {
+  const bare = new Map<string, number>();
+  for (const c of cases) bare.set(c.name, (bare.get(c.name) ?? 0) + 1);
+
+  const qualified = cases.map((c) =>
+    (bare.get(c.name) ?? 0) > 1 && c.where ? { ...c, name: `${c.name}（${c.where}）` } : c,
+  );
+
+  const used = new Map<string, number>();
+  return qualified.map((c) => {
+    const nth = (used.get(c.name) ?? 0) + 1;
+    used.set(c.name, nth);
+    return nth === 1 ? c : { ...c, name: `${c.name} #${nth}` };
+  });
+}
+
 function renderCase(tc: Testcase, time: string): string[] {
-  const head = `    <testcase name="${escapeXml(tc.name)}" classname="${escapeXml(tc.classname)}" time="${time}"`;
+  const head = `    <testcase name="${escapeAttr(tc.name)}" classname="${escapeAttr(tc.classname)}" time="${time}"`;
   if (tc.kind === "pass" && !tc.body) return [`${head} />`];
 
   const lines = [`${head}>`];
   const body = escapeXml(tc.body ?? "");
-  const message = escapeXml(tc.message ?? "");
+  const message = escapeAttr(tc.message ?? "");
   if (tc.kind === "failure") {
-    lines.push(`      <failure type="${escapeXml(tc.type ?? "")}" message="${message}">${body}</failure>`);
+    lines.push(`      <failure type="${escapeAttr(tc.type ?? "")}" message="${message}">${body}</failure>`);
   } else if (tc.kind === "error") {
     lines.push(`      <error message="${message}">${body}</error>`);
   } else if (tc.kind === "skipped") {
@@ -200,20 +288,20 @@ function renderCase(tc: Testcase, time: string): string[] {
 }
 
 function renderSuite(suite: Testsuite, timestamp: string): string[] {
-  const { cases } = suite;
+  const cases = withUniqueNames(suite.cases);
   // 單筆發現沒有各自的耗時。把檢查耗時平均攤到 testcase 上，面板加總才會等於實際時間；
   // 每筆都填整個檢查的時間，會讓一個十筆發現的檢查看起來跑了十倍久。
   const perCase = seconds(cases.length > 0 ? suite.durationMs / cases.length : 0);
   const lines = [
-    `  <testsuite name="${escapeXml(suite.name)}" classname="${escapeXml(suite.classname)}"` +
+    `  <testsuite name="${escapeAttr(suite.name)}" classname="${escapeAttr(suite.classname)}"` +
       ` tests="${cases.length}" failures="${count(cases, "failure")}" errors="${count(cases, "error")}"` +
       ` skipped="${count(cases, "skipped")}" time="${seconds(suite.durationMs)}"` +
-      ` timestamp="${escapeXml(timestamp)}">`,
+      ` timestamp="${escapeAttr(timestamp)}">`,
   ];
   if (suite.properties.length > 0) {
     lines.push("    <properties>");
     for (const [name, value] of suite.properties) {
-      lines.push(`      <property name="${escapeXml(name)}" value="${escapeXml(value)}" />`);
+      lines.push(`      <property name="${escapeAttr(name)}" value="${escapeAttr(value)}" />`);
     }
     lines.push("    </properties>");
   }
@@ -229,7 +317,7 @@ function renderSuite(suite: Testsuite, timestamp: string): string[] {
  * 這樣「CI 結束碼是紅的」跟「面板上有紅叉」永遠是同一件事，不會互相打臉。
  */
 export function renderJunit(report: RunReport, failOn: Severity): string {
-  const suites = [
+  const suites: Testsuite[] = [
     ...report.results.map(
       (r): Testsuite => ({
         name: r.check,
@@ -247,6 +335,8 @@ export function renderJunit(report: RunReport, failOn: Severity): string {
     ...suppressedSuite(report),
     ...coverageSuite(report),
   ];
+  // 一筆 testcase 都沒有的輸出會被面板讀成綠燈，所以空報告要自己補上一句「這裡是空的」。
+  if (suites.every((s) => s.cases.length === 0)) suites.push(emptyRunSuite(report));
 
   const all = suites.flatMap((s) => s.cases);
   const lines: string[] = ['<?xml version="1.0" encoding="UTF-8"?>'];

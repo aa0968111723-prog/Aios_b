@@ -7,9 +7,12 @@
  * 轉檔時最容易掉的東西是「沒測到」：SARIF 的資料模型天生只描述「找到了什麼」，
  * 沒有任何欄位在講「什麼沒跑到」。照字面轉的話，一輪「連不到站台、全部跳過」的執行
  * 會變成一份漂亮的空 SARIF，在 GitHub 上跟「全部通過」長得一模一樣——那正是本專案
- * 最不能接受的失效方式。所以這裡把跳過與執行錯誤逐筆寫進
+ * 最不能接受的失效方式。所以這裡把跳過、執行錯誤與被縮小的範圍逐筆寫進
  * `invocations[].toolExecutionNotifications`，並讓 `invocations[].executionSuccessful`
- * 如實反映有沒有檢查自己爆掉。轉檔不負責把結論變好看，只負責不把「未執行」洗成「通過」。
+ * 如實反映兩件事：有沒有檢查自己爆掉，以及**這一輪到底有沒有檢查真的跑完**。
+ * 後者是這個模組唯一會「主動判斷」的事——一份 result 為空、executionSuccessful 為 true 的
+ * SARIF，在 code scanning 上就是一面綠燈，而它可能只代表站台連不上、一項都沒驗到。
+ * 轉檔不負責把結論變好看，只負責不把「未執行」洗成「通過」。
  */
 import { severityRank, sortFindings } from "../core/severity.js";
 import { findingKey } from "../core/findings.js";
@@ -26,6 +29,21 @@ const TOOL_INFORMATION_URI = "https://github.com/aa0968111723-prog/Aios_b";
 const CHECKS_DOC_URI = `${TOOL_INFORMATION_URI}/blob/main/docs/CHECKS.md`;
 /** 連受測目標都拿不到時的最後退路：SARIF 的 uri 不接受空字串，但也不該憑空編一個檔案路徑。 */
 const UNLOCATED_URI = "urn:aios-sentinel:unlocated";
+
+/**
+ * 可以原樣當成位置用的 scheme。
+ *
+ * 為什麼是白名單，而不是「只要 `new URL()` 解析得過就放行」：URL 解析器眼中，
+ * `x.ts:42`（帶行號的檔案路徑）與 `ai-os-app.zeabur.app:443`（主機加埠）都是合法的絕對 URI，
+ * scheme 分別是 `x.ts` 與 `ai-os-app.zeabur.app`。原樣輸出的話，code scanning 會收到一個
+ * 指不到任何檔案的位置，而讀者只看得到一條點不開的連結。
+ *
+ * 還有一層考量：`where` 不全是我們自己組出來的字串——供應鏈檢查會把頁面上的
+ * `<script src>` 當作位置，而那是受測頁面提供的內容。`data:` 與 `javascript:` 這類 scheme
+ * 沒有理由被原封不動放進一個會被 UI 當連結呈現的欄位。認得的 scheme 才走 URL 正規化，
+ * 其餘一律退回路徑處理（順帶解決 Windows 的 `C:\repo`——單字母磁碟機代號本來就不在名單內）。
+ */
+const URI_SCHEMES = new Set(["http", "https", "file", "urn"]);
 
 const LEVEL_BY_SEVERITY: Record<Severity, SarifLevel> = {
   critical: "error",
@@ -66,7 +84,8 @@ export interface SarifResult {
   message: { text: string };
   locations: Array<{ physicalLocation: { artifactLocation: { uri: string } } }>;
   partialFingerprints: { aiosSentinelId: string };
-  properties: { severity: Severity; surface: string; check: string };
+  /** `evidence` 是實際觀測到的字串，只在該筆發現有留證據時出現。 */
+  properties: { severity: Severity; surface: string; check: string; evidence?: string };
   /** 有值代表這筆被抑制清單移出主清單；GitHub 會顯示成「已關閉（附理由）」。 */
   suppressions?: Array<{ kind: "external"; justification: string }>;
 }
@@ -78,6 +97,19 @@ export interface SarifNotification {
   properties?: Record<string, unknown>;
 }
 
+/**
+ * 通知的描述子。
+ *
+ * SARIF 規定 `notification.descriptor` 指向的是 driver 宣告過的描述子；不宣告的話，
+ * 消費端拿到的只是一個沒有定義的字串 id。宣告出來還有一個實際好處：讀者在 SARIF 檔案裡
+ * 就能看懂 `check.skipped` 是什麼意思，不必回頭翻這份原始碼。
+ */
+export interface SarifNotificationDescriptor {
+  id: string;
+  shortDescription: { text: string };
+  fullDescription: { text: string };
+}
+
 export interface SarifInvocation {
   executionSuccessful: boolean;
   startTimeUtc?: string;
@@ -86,7 +118,14 @@ export interface SarifInvocation {
 }
 
 export interface SarifRun {
-  tool: { driver: { name: string; informationUri: string; rules: SarifRule[] } };
+  tool: {
+    driver: {
+      name: string;
+      informationUri: string;
+      rules: SarifRule[];
+      notifications: SarifNotificationDescriptor[];
+    };
+  };
   results: SarifResult[];
   invocations: SarifInvocation[];
 }
@@ -96,6 +135,46 @@ export interface SarifLog {
   version: "2.1.0";
   runs: SarifRun[];
 }
+
+/**
+ * 四種「這一輪有事情沒跑到」的通知。
+ *
+ * 一律宣告，即使這一輪一筆都沒用到：一份完整的描述子清單本身就是在告訴讀者
+ * 「這個工具會回報哪些未執行狀況」，而讀者要判斷一份乾淨的報告可不可信，
+ * 靠的正是知道它在什麼情況下會出聲。
+ */
+const NOTIFICATION_DESCRIPTORS: SarifNotificationDescriptor[] = [
+  {
+    id: "run.nothing-executed",
+    shortDescription: { text: "本輪沒有任何檢查真正執行完成" },
+    fullDescription: {
+      text:
+        "所有檢查都被跳過、被過濾或自己爆掉。此時 results 是空的，而一份沒有 result 的 SARIF " +
+        "在 code scanning 上與「全部通過」長得一模一樣，所以同一輪也會把 executionSuccessful 標成 false。",
+    },
+  },
+  {
+    id: "run.filtered",
+    shortDescription: { text: "本輪的檢測範圍被刻意縮小" },
+    fullDescription: {
+      text: "使用了 --only／--skip。被排除的項目在這份結果裡沒有任何結論，不代表它們通過。",
+    },
+  },
+  {
+    id: "check.skipped",
+    shortDescription: { text: "某一項檢查被跳過" },
+    fullDescription: {
+      text: "缺少必要條件（憑證、瀏覽器、原始碼路徑）或目標沒有該功能。跳過不等於通過。",
+    },
+  },
+  {
+    id: "check.errored",
+    shortDescription: { text: "某一項檢查自己執行失敗" },
+    fullDescription: {
+      text: "是檢測器故障，不是受測目標的問題；該項在本輪沒有任何結論，必須與「發現問題」分開看。",
+    },
+  },
+];
 
 export function severityToSarifLevel(severity: Severity): SarifLevel {
   return LEVEL_BY_SEVERITY[severity];
@@ -117,20 +196,19 @@ function normalizeUri(value: string | null | undefined): string | null {
   const raw = (value ?? "").trim();
   if (raw === "") return null;
 
-  // 已經帶 scheme 的絕對 URI（http／https／file…）交給 URL 正規化，順便驗證它真的合法。
-  // 例外是 Windows 的磁碟機代號：`C:\repo` 在正則上看起來也像 scheme，要先排除。
-  const looksLikeDrive = /^[A-Za-z]:[\\/]/.test(raw);
-  if (!looksLikeDrive && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(raw)) {
+  // 認得的 scheme 交給 URL 正規化，順便驗證它真的合法；其餘一律往下當路徑處理。
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(raw)?.[1]?.toLowerCase();
+  if (scheme !== undefined && URI_SCHEMES.has(scheme)) {
     try {
       return new URL(raw).toString();
     } catch {
-      // 不是合法 URI（例如 `weird:thing`），往下當成路徑處理。
+      // 有 scheme 但組不成 URL（例如少了主機的 `https://`）：當成路徑，不輸出半成品。
     }
   }
 
   const slashed = raw.replace(/\\/g, "/");
   const drive = /^([A-Za-z]):\/(.*)$/.exec(slashed);
-  if (drive) return `file:///${drive[1]}:/${encodePath(drive[2] ?? "")}`;
+  if (drive) return `file:///${drive[1] ?? ""}:/${encodePath(drive[2] ?? "")}`;
   if (slashed.startsWith("/")) return `file://${encodePath(slashed)}`;
   return encodePath(slashed.replace(/^\.\//, ""));
 }
@@ -151,7 +229,7 @@ export function sarifRuleFor(finding: Finding): SarifRule {
     fullDescription: { text: finding.detail },
     // help.text 是 code scanning 介面上唯一會顯示修法的位置。修法沒放進來，
     // 讀者在 GitHub 上就只看得到「你有問題」，看不到「怎麼修」——那種告警最後都會被關掉。
-    help: { text: finding.remediation ?? "（未提供修法）" },
+    help: { text: finding.remediation ?? "（這筆發現沒有附修法；判定依據見 helpUri 的檢查項目對照表）" },
     helpUri: CHECKS_DOC_URI,
     defaultConfiguration: { level: severityToSarifLevel(finding.severity) },
     properties: {
@@ -199,7 +277,23 @@ function buildRules(findings: Finding[]): { rules: SarifRule[]; indexById: Map<s
   return { rules, indexById };
 }
 
+const EVIDENCE_LIMIT = 1200;
+
+/** 證據可能是一整份回應標頭。SARIF 會整份上傳，過長的原文只會讓檔案膨脹，先截斷再帶走。 */
+function clipEvidence(evidence: string): string {
+  return evidence.length > EVIDENCE_LIMIT ? `${evidence.slice(0, EVIDENCE_LIMIT)}…（證據已截斷）` : evidence;
+}
+
 function toResult(finding: Finding, ctx: { ruleIndex: number; fallbackUri: string }): SarifResult {
+  // message.text 刻意只放標題與說明——那是告警列表上直接顯示的內容，塞進整份標頭會沒人看得下去。
+  // 觀測到的原文改放 properties：SARIF 檢視器與後續程式拿得到，重現問題時不必回頭翻別的報告。
+  const properties: SarifResult["properties"] = {
+    severity: finding.severity,
+    surface: finding.surface,
+    check: finding.check,
+  };
+  if (finding.evidence) properties.evidence = clipEvidence(finding.evidence);
+
   return {
     ruleId: finding.id,
     ruleIndex: ctx.ruleIndex,
@@ -211,7 +305,7 @@ function toResult(finding: Finding, ctx: { ruleIndex: number; fallbackUri: strin
     // 指紋用的是全系統共用的那把鍵（去重、抑制清單、基準比對都用它），跨次執行才對得起來。
     // 沒有指紋，GitHub 每輪掃描都會把同一件事當成一批「新的」告警，幾輪之後就沒有人再看那頁了。
     partialFingerprints: { aiosSentinelId: findingKey(finding) },
-    properties: { severity: finding.severity, surface: finding.surface, check: finding.check },
+    properties,
   };
 }
 
@@ -223,14 +317,48 @@ function justificationFor(record: SuppressedFindingRecord): string {
 }
 
 /**
+ * 這一輪真正跑完的檢查數。
+ *
+ * `meta` 結果（抑制清單的提醒、基準檔讀取錯誤）雖然標著 completed，但它們不是檢查——
+ * 把它們算進來，一輪「連站台都連不到、每一項都跳過」卻剛好帶了 `--suppress` 的執行，
+ * 就會憑空多出一項「完成」的檢查，於是 SARIF 上不再有人說「什麼都沒驗到」。
+ * 判準與 summary、`exitCodeFor` 的 exit 3 完全一致——三處各算各的，遲早會有一處先說謊。
+ */
+function completedCheckCount(report: RunReport): number {
+  return report.results.filter((r) => !r.meta && r.completed).length;
+}
+
+/**
  * 「這一輪有哪些事沒跑到」——SARIF 裡唯一能承載這個資訊的地方。
  *
- * 三種都算沒跑到：檢查自己爆掉、檢查被跳過、以及本輪範圍被 `--only`／`--skip` 縮小過。
- * 第三種在別的報告層是最上方的告示，在這裡同樣不能省：一份只跑了 CSP 的 SARIF
- * 上傳到 code scanning 後，看起來就跟「全站都查過而且很乾淨」一樣。
+ * 四種都算沒跑到：一項都沒跑完、檢查自己爆掉、檢查被跳過、以及本輪範圍被
+ * `--only`／`--skip` 縮小過。第三、四種在別的報告層是最上方的告示，在這裡同樣不能省：
+ * 一份只跑了 CSP 的 SARIF 上傳到 code scanning 後，看起來就跟「全站都查過而且很乾淨」一樣。
  */
 function buildNotifications(report: RunReport): SarifNotification[] {
   const out: SarifNotification[] = [];
+
+  // 這一條要排在最前面：其餘通知是逐項的細節，而它講的是整份結果能不能當一回事。
+  const planned = report.results.filter((r) => !r.meta).length;
+  if (completedCheckCount(report) === 0) {
+    // 措辭刻意不寫成「下面沒有任何發現」：後製的提醒（抑制清單、基準檔）也會產生發現，
+    // 一輪什麼都沒驗到的執行仍可能帶著幾筆 result。要講的是「這些發現不代表目標的狀態」。
+    const scope =
+      planned === 0
+        ? "本輪沒有排定任何檢查"
+        : `本輪排定 ${planned} 項檢查，完成 0 項（全部被跳過、被過濾或執行失敗）`;
+    out.push({
+      descriptor: { id: "run.nothing-executed" },
+      level: "error",
+      message: {
+        text:
+          `${scope}。這份結果不論有沒有列出發現，都不代表受測目標的狀態——` +
+          "這一輪沒有任何一項檢查真的量到東西。請先確認執行環境（站台是否可達、認證、瀏覽器、" +
+          "原始碼路徑）再重跑，不要把這份結果當成一次檢測。",
+      },
+      properties: { plannedChecks: planned, completedChecks: 0 },
+    });
+  }
 
   const filter = report.filter;
   if (filter && (filter.only.length > 0 || filter.skip.length > 0)) {
@@ -313,13 +441,24 @@ export function renderSarif(report: RunReport): string {
     version: "2.1.0",
     runs: [
       {
-        tool: { driver: { name: TOOL_NAME, informationUri: TOOL_INFORMATION_URI, rules } },
+        tool: {
+          driver: {
+            name: TOOL_NAME,
+            informationUri: TOOL_INFORMATION_URI,
+            rules,
+            notifications: NOTIFICATION_DESCRIPTORS,
+          },
+        },
         results,
         invocations: [
           {
-            // 只要有檢查自己爆掉，這一輪就不是一次成功的執行。跳過不算失敗（那是有意識的略過，
-            // 已經逐筆寫進 notifications），但檢測器故障必須讓消費端一眼看得出來。
-            executionSuccessful: report.results.every((r) => !r.error),
+            // 兩種情況才算「這次執行不成功」：有檢查自己爆掉，或者一項都沒跑完。
+            //
+            // 少數幾項被跳過不算失敗——那是有意識的略過，已經逐筆寫進 notifications。
+            // 但**一項都沒跑完**是另一回事：那時 results 恆為空，而空的 SARIF 在 code scanning 上
+            // 就是一片綠。這是本專案最反對的假綠燈，與 `exitCodeFor` 特地保留 exit 3 同一個理由，
+            // 所以這裡不靠讀者自己去翻 notifications，直接讓這一輪表態它不成立。
+            executionSuccessful: completedCheckCount(report) > 0 && report.results.every((r) => !r.error),
             startTimeUtc: utcOrUndefined(report.startedAt),
             endTimeUtc: utcOrUndefined(report.finishedAt),
             toolExecutionNotifications: buildNotifications(report),

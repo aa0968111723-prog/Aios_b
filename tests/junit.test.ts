@@ -110,6 +110,22 @@ function occurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
+/**
+ * 落單的代理對（半個字元）。
+ *
+ * 刻意不加 `u` 旗標：要找的正是「單獨出現的一個 UTF-16 單位」，而 `u` 模式會把字串當成
+ * 完整的碼位序列來看，反而看不到那半個字元。它寫進檔案後會變成一個問號方塊，
+ * 而讀者會把它當成站台真的回了亂碼——一個由報告自己製造出來的假觀測值。
+ */
+function hasLoneSurrogate(text: string): boolean {
+  return /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text);
+}
+
+/** 抓出所有 testcase 的身分（name + classname）。面板就是用這組值當測試主鍵。 */
+function testcaseIdentities(xml: string): string[] {
+  return [...xml.matchAll(/<testcase name="([^"]*)" classname="([^"]*)"/g)].map((m) => `${m[2]}::${m[1]}`);
+}
+
 describe("escapeXml", () => {
   it("五個 XML 特殊字元都被跳脫", () => {
     expect(escapeXml(`&<>"'`)).toBe("&amp;&lt;&gt;&quot;&apos;");

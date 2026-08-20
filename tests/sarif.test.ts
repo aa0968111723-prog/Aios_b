@@ -2,8 +2,9 @@
  * SARIF 匯出的測試。
  *
  * 這一層值得測的不是「有沒有吐出檔案」，而是**轉檔過程有沒有把資訊弄丟或弄反**：
- * 跳過被洗成通過、同一件事每輪都變成新告警、修法在 code scanning 上看不到——
- * 這三種失誤都不會讓程式壞掉，只會讓報告安靜地失去可信度，所以只能靠測試守住。
+ * 一輪什麼都沒跑到卻輸出一份看起來很乾淨的空 SARIF、跳過被洗成通過、
+ * 同一件事每輪都變成新告警、修法在 code scanning 上看不到——
+ * 這四種失誤都不會讓程式壞掉，只會讓報告安靜地失去可信度，所以只能靠測試守住。
  */
 import { describe, expect, it } from "vitest";
 import { renderSarif, sarifRuleFor, severityToSarifLevel, toArtifactUri } from "../src/report/sarif.js";
@@ -137,6 +138,12 @@ describe("sarifRuleFor", () => {
     const rule = sarifRuleFor(makeFinding({ id: "cookies.httponly.sid", remediation: "會話 Cookie 加上 HttpOnly。" }));
     expect(rule.help.text).toBe("會話 Cookie 加上 HttpOnly。");
   });
+
+  it("發現漏填修法時 help.text 仍要說話——空白的說明欄在介面上等於這條規則沒有交代", () => {
+    const rule = sarifRuleFor(makeFinding({ id: "x.y", remediation: undefined }));
+    expect(rule.help.text).toContain("沒有附修法");
+    expect(rule.helpUri).toContain("CHECKS.md");
+  });
 });
 
 describe("規則去重", () => {
@@ -219,6 +226,20 @@ describe("result 內容", () => {
     const run = firstRun(makeReport({ results: [makeResult({ check: "transport", surface: "desktop", findings: [f] })] }));
     expect(run.results[0]!.properties).toEqual({ severity: "medium", surface: "desktop", check: "transport" });
   });
+
+  it("證據跟著 result 一起帶走，維運者不必為了看實際觀測值再去翻另一份報告", () => {
+    const f = makeFinding({ id: "headers.hsts.missing", evidence: "strict-transport-security：（沒有這個標頭）" });
+    const run = firstRun(makeReport({ results: [makeResult({ check: "security-headers", findings: [f] })] }));
+    expect(run.results[0]!.properties.evidence).toBe("strict-transport-security：（沒有這個標頭）");
+  });
+
+  it("過長的證據會截斷——一份把整份回應塞進去的 SARIF 會大到上傳不了", () => {
+    const f = makeFinding({ id: "disclosure.stacktrace", evidence: "壹".repeat(5000) });
+    const run = firstRun(makeReport({ results: [makeResult({ check: "disclosure", findings: [f] })] }));
+    const evidence = run.results[0]!.properties.evidence ?? "";
+    expect(evidence.length).toBeLessThan(1300);
+    expect(evidence).toContain("已截斷");
+  });
 });
 
 describe("位置（artifactLocation.uri）", () => {
@@ -240,6 +261,25 @@ describe("位置（artifactLocation.uri）", () => {
     expect(toArtifactUri("./ai_os/capacitor.config.ts", "https://a.test")).toBe("ai_os/capacitor.config.ts");
   });
 
+  it("--repo 指到上層目錄時的 ../ 路徑保持相對，硬轉 file:// 會讓 PR 標註失效", () => {
+    expect(toArtifactUri("../ai_os/src-tauri/capabilities/remote.json", "https://a.test")).toBe(
+      "../ai_os/src-tauri/capabilities/remote.json",
+    );
+  });
+
+  it("只是「看起來像」scheme 的字串不會被當成絕對 URI 原樣輸出", () => {
+    // 這兩個在 URL 解析器眼中都是合法的絕對 URI（scheme 分別被解讀成 x.ts 與整串主機名），
+    // 原樣輸出的話 code scanning 會收到一個指不到任何檔案、也點不開的位置。
+    expect(toArtifactUri("x.ts:42", "https://a.test")).toBe("x.ts%3A42");
+    expect(toArtifactUri("ai-os-app.zeabur.app:443", "https://a.test")).toBe("ai-os-app.zeabur.app%3A443");
+  });
+
+  it("受測頁面提供的 javascript:／data: 不會原封不動變成位置", () => {
+    // 供應鏈檢查會把頁面上的 <script src> 當作位置，而那是受測站台給的內容。
+    expect(toArtifactUri("javascript:alert(1)", "https://a.test").startsWith("javascript:")).toBe(false);
+    expect(toArtifactUri("data:text/javascript,alert(1)", "https://a.test").startsWith("data:")).toBe(false);
+  });
+
   it("where 缺席時退回受測目標，不會輸出空的 uri", () => {
     const f = makeFinding({ id: "health.unreachable" });
     const run = firstRun(makeReport({ results: [makeResult({ check: "health", findings: [f] })] }));
@@ -252,7 +292,10 @@ describe("沒測到的部分（toolExecutionNotifications）", () => {
   it("跳過的檢查寫成 warning 通知，並明說跳過不等於通過", () => {
     const run = firstRun(
       makeReport({
-        results: [makeResult({ check: "page-test", completed: false, skippedReason: "缺少 playwright 瀏覽器。" })],
+        results: [
+          makeResult({ check: "transport" }),
+          makeResult({ check: "page-test", completed: false, skippedReason: "缺少 playwright 瀏覽器。" }),
+        ],
       }),
     );
     const notes = run.invocations[0]!.toolExecutionNotifications;
@@ -262,9 +305,21 @@ describe("沒測到的部分（toolExecutionNotifications）", () => {
     expect(notes[0]!.message.text).toContain("page-test");
     expect(notes[0]!.message.text).toContain("缺少 playwright 瀏覽器。");
     expect(notes[0]!.message.text).toContain("跳過不等於通過");
+    // 二十項裡跳過一項是常態，不該讓整輪被標成失敗——真正要警覺的是「一項都沒跑完」。
+    expect(run.invocations[0]!.executionSuccessful).toBe(true);
   });
 
-  it("全部跳過時 results 為空，但 SARIF 上仍看得到「什麼都沒驗」", () => {
+  it("跳過卻沒記錄原因時照樣出聲，不會因為少一段文字就被當成通過", () => {
+    const run = firstRun(
+      makeReport({ results: [makeResult({ check: "transport" }), makeResult({ check: "a11y", completed: false })] }),
+    );
+    const notes = run.invocations[0]!.toolExecutionNotifications;
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.descriptor.id).toBe("check.skipped");
+    expect(notes[0]!.message.text).toContain("a11y");
+  });
+
+  it("全部跳過時 results 為空，SARIF 必須自己講出「什麼都沒驗」而不是留一片綠", () => {
     const run = firstRun(
       makeReport({
         results: [
@@ -274,15 +329,54 @@ describe("沒測到的部分（toolExecutionNotifications）", () => {
       }),
     );
     expect(run.results).toEqual([]);
-    expect(run.invocations[0]!.toolExecutionNotifications).toHaveLength(2);
-    // 跳過是有意識的略過，不是檢測器故障——executionSuccessful 不該因此變 false。
-    expect(run.invocations[0]!.executionSuccessful).toBe(true);
+    const notes = run.invocations[0]!.toolExecutionNotifications;
+    // 整輪的結論排在逐項細節前面：讀者先知道這份結果不能當一回事，再看是哪幾項沒跑。
+    expect(notes.map((n) => n.descriptor.id)).toEqual(["run.nothing-executed", "check.skipped", "check.skipped"]);
+    expect(notes[0]!.level).toBe("error");
+    expect(notes[0]!.message.text).toContain("完成 0 項");
+    // 空的 results 配上 executionSuccessful=true，在 code scanning 上與「全站掃過、很乾淨」
+    // 完全無法區分。這種假綠燈比紅燈危險，所以一項都沒跑完的執行一律不算成功。
+    expect(run.invocations[0]!.executionSuccessful).toBe(false);
+  });
+
+  it("連一項檢查都沒排到時，同樣不准看起來像全部通過", () => {
+    const run = firstRun(makeReport({ results: [] }));
+    expect(run.results).toEqual([]);
+    const notes = run.invocations[0]!.toolExecutionNotifications;
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.descriptor.id).toBe("run.nothing-executed");
+    expect(run.invocations[0]!.executionSuccessful).toBe(false);
+  });
+
+  it("後製產生的 meta 結果不算跑過檢查——帶了 --suppress 不該讓空轉的一輪變成綠燈", () => {
+    const note = makeFinding({
+      id: "suppress.unused-rule.old",
+      check: "suppress",
+      category: "integrity",
+      surface: "all",
+      severity: "info",
+    });
+    const run = firstRun(
+      makeReport({
+        results: [
+          makeResult({ check: "transport", completed: false, skippedReason: "連不到站台。" }),
+          makeResult({ check: "suppress", category: "integrity", surface: "all", meta: true, findings: [note] }),
+        ],
+      }),
+    );
+    // meta 的發現照樣要看得見，但它不能把「什麼都沒驗」洗成「有跑」。
+    expect(run.results).toHaveLength(1);
+    expect(run.invocations[0]!.toolExecutionNotifications[0]!.descriptor.id).toBe("run.nothing-executed");
+    expect(run.invocations[0]!.executionSuccessful).toBe(false);
   });
 
   it("檢查自己爆掉是 error 通知，且 executionSuccessful 為 false", () => {
     const run = firstRun(
       makeReport({
-        results: [makeResult({ check: "dbTraffic", completed: false, error: "TypeError: x is not a function" })],
+        results: [
+          makeResult({ check: "transport" }),
+          makeResult({ check: "db-traffic", completed: false, error: "TypeError: x is not a function" }),
+        ],
       }),
     );
     const notes = run.invocations[0]!.toolExecutionNotifications;
@@ -290,6 +384,7 @@ describe("沒測到的部分（toolExecutionNotifications）", () => {
     expect(notes[0]!.descriptor.id).toBe("check.errored");
     expect(notes[0]!.level).toBe("error");
     expect(notes[0]!.message.text).toContain("TypeError: x is not a function");
+    // 別的項目照常跑完，但檢測器故障本身就足以讓這一輪不算成功。
     expect(run.invocations[0]!.executionSuccessful).toBe(false);
   });
 
@@ -301,8 +396,26 @@ describe("沒測到的部分（toolExecutionNotifications）", () => {
     expect(notes[0]!.message.text).toContain("不代表通過");
   });
 
+  it("--skip 也要留下痕跡，不能只有 --only 才出聲", () => {
+    const run = firstRun(makeReport({ filter: { only: [], skip: ["rate-limit"] } }));
+    const notes = run.invocations[0]!.toolExecutionNotifications;
+    expect(notes[0]!.descriptor.id).toBe("run.filtered");
+    expect(notes[0]!.message.text).toContain("rate-limit");
+  });
+
   it("沒有過濾也沒有未完成的檢查時不會生出多餘通知", () => {
     expect(firstRun(makeReport()).invocations[0]!.toolExecutionNotifications).toEqual([]);
+  });
+
+  it("driver 宣告了所有通知描述子——只丟一個 id 給消費端，等於沒有說明", () => {
+    const declared = firstRun(makeReport()).tool.driver.notifications;
+    expect(declared.map((d) => d.id).sort()).toEqual([
+      "check.errored",
+      "check.skipped",
+      "run.filtered",
+      "run.nothing-executed",
+    ]);
+    for (const d of declared) expect(d.fullDescription.text.length).toBeGreaterThan(0);
   });
 });
 
@@ -320,6 +433,32 @@ describe("被抑制的發現", () => {
     expect(suppression.justification).toContain("平台組");
     // 抑制掉的發現同樣要有規則，否則 GitHub 收到一筆指不到規則的 result。
     expect(run.tool.driver.rules.map((r) => r.id)).toContain("csp.style-src.unsafe-inline");
+  });
+
+  it("沒有到期日的抑制在理由裡寫成「永久」，讓無限期的忽略無所遁形", () => {
+    const f = makeFinding({ id: "csp.style-src.unsafe-inline", severity: "low" });
+    const run = firstRun(makeReport({ suppressed: [{ finding: f, reason: "已知取捨", expires: null, owner: null }] }));
+    const justification = run.results[0]!.suppressions![0]!.justification;
+    expect(justification).toContain("永久");
+    // 沒有負責人時不要硬生出一個空欄位，讀者會以為那是有人認領過的。
+    expect(justification).not.toContain("負責人");
+  });
+
+  it("同一個 id 一處被抑制、一處沒有時，規則仍取最嚴重的那一筆，兩筆 result 也各自指得到它", () => {
+    const kept = makeFinding({ id: "cookies.secure.sid", severity: "high", where: "https://a.test/" });
+    const hidden = makeFinding({ id: "cookies.secure.sid", severity: "low", where: "https://a.test/x" });
+    const run = firstRun(
+      makeReport({
+        results: [makeResult({ check: "cookies", findings: [kept] })],
+        suppressed: [{ finding: hidden, reason: "另一條路徑上是靜態資源", expires: "2026-12-31", owner: null }],
+      }),
+    );
+    expect(run.tool.driver.rules).toHaveLength(1);
+    expect(run.tool.driver.rules[0]!.properties["security-severity"]).toBe("7.5");
+    expect(run.results).toHaveLength(2);
+    for (const result of run.results) {
+      expect(run.tool.driver.rules[result.ruleIndex]!.id).toBe(result.ruleId);
+    }
   });
 
   it("沒被抑制的發現不會帶 suppressions（別讓 GitHub 誤以為它已經關掉）", () => {
