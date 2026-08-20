@@ -266,7 +266,7 @@ HttpOnly 是 low。一律同級只會讓人整批關掉告警。
 ## 開發
 
 ```bash
-npm test          # 176 項單元測試，全部離線可跑
+npm test          # 758 項測試，全部離線可跑（含以本機假站台驅動的端到端測試）
 npm run typecheck
 ```
 
@@ -275,14 +275,27 @@ npm run typecheck
 網路與檔案 I/O 集中在各偵測器的 `check*` 進入點。資安規則最容易寫錯，而寫錯的規則
 會製造假綠燈——所以規則必須能在沒有網路、不依賴線上站當時設定的情況下被測試。
 
+測試分三層，各自擋不同的失效方式：
+
+| 層 | 驗什麼 | 為什麼純函式測試不夠 |
+| --- | --- | --- |
+| 純函式 | 判定規則本身 | — |
+| 假 fetch 驅動的 `check*` | `completed` 與 `skippedReason` 的語意 | 「跳過還是通過」是 IO 層的決定，純函式看不到 |
+| `tests/cli.e2e.test.ts` | 接線 | 一個忘了接上的偵測器，在報告上看起來就跟「這項沒發現問題」一模一樣 |
+
+端到端測試起一個本機假站台（SPA 兜底、健康端點、沒有安全標頭），用子行程跑真正的 CLI 打它，
+不碰外部網路。
+
 ```
 src/
-  core/       型別、嚴重度、HTTP 探針、surface 定義、連通性前置檢查、執行編排、ai_os 探測
+  core/       型別、嚴重度、HTTP 探針、surface 定義、連通性前置檢查、執行編排、ai_os 探測、
+              跨次比對（baseline）、抑制清單（suppress）、檢查過濾（filter）、報告後製（annotate）
   detectors/  health / transport / csp / headers / cookies / authGate /
-              disclosure / cors / buildDrift / shellAudit /
+              disclosure / cors / buildDrift / shellAudit / tls / methods /
+              redirect / supplyChain / wellknown / rateLimit /
               analytics（PostHog）/ zeabur / dbTraffic / device
   pages/      browser（playwright 薄封裝）/ routes / pageTest / a11y
-  report/     console / markdown / html
+  report/     console / markdown / html / sarif / junit
 ```
 
 ## 涵蓋不到的部分
