@@ -402,5 +402,45 @@ export async function checkMethods(surface: Surface, timeoutMs: number): Promise
     );
   }
 
-  return { ...base, completed: true, durationMs: elapsed(), findings, facts };
+  return {
+    ...base,
+    completed: true,
+    durationMs: elapsed(),
+    findings: collapseTraceUnknown(findings, surface.origin),
+    facts,
+  };
+}
+
+/**
+ * 把逐路徑的「TRACE 未判定」收攏成一筆。
+ *
+ * `analyzeMethods` 是逐路徑的純函式，所以三條路徑都判不出 TRACE 時會產出三筆一模一樣的
+ * info——標題、說明、修法逐字相同，只有 `where` 不同。而三條路徑判不出來的原因幾乎總是
+ * 同一個（執行環境擋下 TRACE、或整個站台前面有代理），所以那是同一件事被講了三次。
+ *
+ * 這件事本身不嚴重，但它會稀釋報告：一份 18 筆發現的報告裡有 3 筆是重複的雜訊，
+ * 讀者對「這份清單值得逐條看」的信任就少一分。降噪是正經工作，info 也一樣要降。
+ *
+ * 收攏而不是直接丟掉：「沒測到」永遠要留在報告上，只是講一次就夠——受影響的路徑
+ * 逐條列進 evidence，`facts.observed` 也照舊留著每條路徑的確切原因。
+ */
+function collapseTraceUnknown(findings: Finding[], origin: string): Finding[] {
+  const unknowns = findings.filter((f) => f.id === "methods.trace.unknown");
+  if (unknowns.length < 2) return findings;
+
+  const first = unknowns[0] as Finding;
+  const paths = unknowns.map((f) => f.where ?? "（未知路徑）");
+  const merged: Finding = {
+    ...first,
+    title: `TRACE 方法未判定（${unknowns.length} 條路徑）`,
+    where: origin,
+    evidence: [`未判定的路徑：`, ...paths.map((p) => `  ${p}`), "", first.evidence ?? ""].join("\n").trimEnd(),
+  };
+
+  const rest = findings.filter((f) => f.id !== "methods.trace.unknown");
+  // 位置維持在原本第一筆出現的地方，報告的閱讀順序才不會因為收攏而跳動。
+  const at = findings.findIndex((f) => f.id === "methods.trace.unknown");
+  const before = rest.filter((f) => findings.indexOf(f) < at);
+  const after = rest.filter((f) => findings.indexOf(f) > at);
+  return [...before, merged, ...after];
 }

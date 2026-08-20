@@ -1,13 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   TRACE_PROBE_HEADER,
   TRACE_PROBE_TOKEN,
   analyzeMethods,
+  checkMethods,
   classifyAllowProbe,
   classifyTraceProbe,
   parseAllowHeader,
   type MethodObservation,
 } from "../src/detectors/methods.js";
+import { buildSurfaces } from "../src/core/surfaces.js";
 
 const apiCtx = { surface: "web" as const, where: "https://example.test/api/v1/databases", isApi: true };
 const siteCtx = { surface: "web" as const, where: "https://example.test/", isApi: false };
@@ -365,5 +367,61 @@ describe("analyzeMethods：發現本身的品質", () => {
   it("同一筆觀測跑兩次結果完全相同（判定不帶任何隨機或時間成分）", () => {
     const obs = observe({ traceStatus: 200, traceEchoesRequest: true, allow: "GET,PUT" });
     expect(analyzeMethods(obs, apiCtx)).toEqual(analyzeMethods(obs, apiCtx));
+  });
+});
+
+/**
+ * 逐路徑的「TRACE 未判定」要收攏成一筆。
+ *
+ * 三條路徑都判不出來時，原因幾乎總是同一個（執行環境擋下 TRACE、或站台前面有代理），
+ * 所以那是同一件事被講了三次。這件事本身不嚴重，但一份 18 筆發現的報告裡有 3 筆是
+ * 重複的雜訊，讀者對「這份清單值得逐條看」的信任就少一分。降噪是正經工作，info 也一樣。
+ */
+describe("checkMethods — 未判定的收攏", () => {
+  const web = buildSurfaces("https://ai-os-app.zeabur.app")[0]!;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("多條路徑都判不出 TRACE 時只報一筆，並列出受影響的路徑", async () => {
+    // OPTIONS 拿得到應用回應（所以整項不會被標記跳過），TRACE 一律送不出去。
+    vi.stubGlobal("fetch", async (input: string | URL, init?: { method?: string }) => {
+      if ((init?.method ?? "GET") === "TRACE") throw new TypeError("TRACE is a forbidden method");
+      return new Response(null, { status: 204, headers: { allow: "GET, HEAD, OPTIONS" } });
+    });
+
+    const result = await checkMethods(web, 1000);
+    const unknowns = result.findings.filter((f) => f.id === "methods.trace.unknown");
+
+    expect(result.completed).toBe(true);
+    expect(unknowns).toHaveLength(1);
+    expect(unknowns[0]?.title).toContain("3 條路徑");
+    // 「沒測到」要留在報告上，只是講一次就夠——路徑仍逐條列在證據裡。
+    expect(unknowns[0]?.evidence).toContain("/api/health");
+    expect(unknowns[0]?.evidence).toContain("/api/v1/databases");
+    // 每條路徑的確切原因照舊留在 facts。
+    expect(Object.keys(result.facts?.observed as object)).toHaveLength(3);
+  });
+
+  it("只有一條路徑未判定時維持原樣，不會多出「N 條路徑」的字樣", async () => {
+    // 其餘兩條由**應用自己**乾脆地拒絕 TRACE（帶應用的 JSON 錯誤格式，
+    // 才不會被當成中介層攔截），所以它們是「判定為關閉」而不是「未判定」。
+    vi.stubGlobal("fetch", async (input: string | URL, init?: { method?: string }) => {
+      const url = String(input);
+      if ((init?.method ?? "GET") === "TRACE") {
+        if (url.endsWith("/api/health")) throw new TypeError("TRACE is a forbidden method");
+        return new Response('{"error":"method not allowed"}', {
+          status: 405,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(null, { status: 204, headers: { allow: "GET, HEAD, OPTIONS" } });
+    });
+
+    const result = await checkMethods(web, 1000);
+    const unknowns = result.findings.filter((f) => f.id === "methods.trace.unknown");
+    expect(unknowns).toHaveLength(1);
+    expect(unknowns[0]?.title).not.toContain("條路徑）");
   });
 });
