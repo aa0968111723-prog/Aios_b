@@ -26,7 +26,7 @@ import { exitCodeFor, perOrigin, perSurface, runChecks, type PlannedCheck } from
 import { annotateReport } from "./core/annotate.js";
 import { parseBaseline } from "./core/baseline.js";
 import { EXAMPLE_SUPPRESSION_FILE, parseSuppressions, type SuppressionProblem, type SuppressionRule } from "./core/suppress.js";
-import { describeFilter, parseFilter, partitionChecks, unknownTokens, type CheckFilter } from "./core/filter.js";
+import { describeFilter, matchesFilter, parseFilter, partitionChecks, unknownTokens, type CheckFilter } from "./core/filter.js";
 import { checkHealth } from "./detectors/health.js";
 import { checkTransport } from "./detectors/transport.js";
 import { checkAuthGate } from "./detectors/authGate.js";
@@ -231,31 +231,60 @@ function skipped(name: string, category: PlannedCheck["category"], surface: Plan
   };
 }
 
+/** `scan` 會排入的所有檢查（名稱與分類）。過濾與「連不到就整組跳過」都以這份為準。 */
+const SCAN_CHECKS: Array<[string, "availability" | "security" | "integrity"]> = [
+  ["health", "availability"],
+  ["transport", "security"],
+  ["auth-gate", "security"],
+  ["disclosure", "security"],
+  ["cors", "security"],
+  ["tls", "security"],
+  ["methods", "security"],
+  ["redirect", "security"],
+  ["supply-chain", "security"],
+  ["wellknown", "security"],
+  ["rate-limit", "security"],
+  ["build-drift", "integrity"],
+];
+
+const MONITOR_CHECKS: Array<[string, "monitoring"]> = [
+  ["analytics", "monitoring"],
+  ["zeabur", "monitoring"],
+  ["db-traffic", "monitoring"],
+  ["device", "monitoring"],
+];
+
+/**
+ * 這組檢查裡還有任何一項會被保留嗎？
+ *
+ * 全部被篩掉時就不該為它們做連通性前置檢查——`--only shell-audit` 是純離線的稽核，
+ * 卻要先對正式站送三個請求並等它們回來，既沒有意義也違反「不要對站台製造無謂流量」。
+ */
+function anyKept(names: Array<[string, PlannedCheck["category"]]>, filter: CheckFilter): boolean {
+  return names.some(([name, category]) => matchesFilter({ name, category }, filter));
+}
+
 /** 某一端連不到時，把它的每一項網路檢查都寫成「跳過＋原因」，而不是讓它們各自回報零發現。 */
 function unreachableScanChecks(surfaceId: SurfaceId, reason: string): PlannedCheck[] {
-  const names: Array<[string, "availability" | "security"]> = [
-    ["health", "availability"],
-    ["transport", "security"],
-    ["auth-gate", "security"],
-    ["disclosure", "security"],
-    ["cors", "security"],
-    ["tls", "security"],
-    ["methods", "security"],
-    ["redirect", "security"],
-    ["supply-chain", "security"],
-    ["wellknown", "security"],
-    ["rate-limit", "security"],
-  ];
-  return names.map(([name, category]) => skipped(name, category, surfaceId, reason));
+  return SCAN_CHECKS.filter(([name]) => name !== "build-drift").map(([name, category]) =>
+    skipped(name, category, surfaceId, reason),
+  );
 }
 
 interface ScanOptions {
   probeRateLimit: boolean;
+  filter: CheckFilter;
 }
 
 async function planScan(config: SentinelConfig, options: ScanOptions): Promise<PlannedCheck[]> {
   const { surfaces, timeoutMs } = config;
   const checks: PlannedCheck[] = [];
+
+  // 這一輪的 scan 檢查全被 --only／--skip 篩掉時，連前置檢查都不必做。
+  // 交還一份完整的「未執行」清單，讓過濾層照常把原因寫進報告。
+  if (!anyKept(SCAN_CHECKS, options.filter)) {
+    return SCAN_CHECKS.map(([name, category]) => skipped(name, category, "all", "本輪未排入執行。"));
+  }
 
   // 先確認每一端連得到。連不到就整組標記跳過——沉默的零發現比誤報更危險。
   const reachable: typeof surfaces = [];
@@ -303,9 +332,13 @@ async function planScan(config: SentinelConfig, options: ScanOptions): Promise<P
 }
 
 /** 監測：使用者行為（PostHog）、平台錯誤（Zeabur）、資料庫進出、裝置紀錄。 */
-async function planMonitor(config: SentinelConfig): Promise<PlannedCheck[]> {
+async function planMonitor(config: SentinelConfig, filter: CheckFilter): Promise<PlannedCheck[]> {
   const { surfaces, timeoutMs, repoPath } = config;
   const checks: PlannedCheck[] = [];
+
+  if (!anyKept(MONITOR_CHECKS, filter)) {
+    return MONITOR_CHECKS.map(([name, category]) => skipped(name, category, "all", "本輪未排入執行。"));
+  }
 
   const reachable: typeof surfaces = [];
   for (const surface of surfaces) {
@@ -473,10 +506,10 @@ async function main(): Promise<void> {
   let cleanup: () => Promise<void> = async () => {};
 
   if (command === "scan" || command === "all") {
-    checks.push(...(await planScan(config, { probeRateLimit: args.flags.get("probe-rate-limit") === true })));
+    checks.push(...(await planScan(config, { probeRateLimit: args.flags.get("probe-rate-limit") === true, filter })));
   }
   if (command === "shells" || command === "all") checks.push(...planShells(config));
-  if (command === "monitor" || command === "all") checks.push(...(await planMonitor(config)));
+  if (command === "monitor" || command === "all") checks.push(...(await planMonitor(config, filter)));
   if (command === "pages" || command === "all") {
     const planned = await planPages(config, args);
     checks.push(...planned.checks);

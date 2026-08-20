@@ -179,6 +179,16 @@ describe("CLI scan 端到端", () => {
 });
 
 describe("CLI --only 端到端", () => {
+  it("純離線的 --only 不會對站台送出任何請求，但檢查仍留在報告上", async () => {
+    // shell-audit 是讀原始碼的稽核。舊版即使只要它，也會先為整組 scan 檢查做連通性
+    // 前置檢查——對正式站送出三個沒有意義的請求，還要等它們回來。
+    const run = await runCli(["scan", "--target", "http://127.0.0.1:1", "--surfaces", "web", "--only", "shell-audit"]);
+    const notRun = run.report.results.filter((r) => !r.completed);
+    expect(notRun.length).toBe(run.report.results.length);
+    // 連不到站台的原因不該出現——因為根本沒去連。
+    expect(notRun.every((r) => (r.skippedReason ?? "").includes("未執行不等於通過"))).toBe(true);
+  }, 120_000);
+
   it("被篩掉的檢查留在報告上（跳過＋原因），不是憑空消失", async () => {
     const run = await runCli(["scan", "--target", origin, "--surfaces", "web", "--only", "health"]);
     const health = resultFor(run.report, "health");
